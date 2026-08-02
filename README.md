@@ -44,3 +44,14 @@ Replace `PASTE_YOUR_RENDER_URL_HERE` with the URL from step 3.7 (keep the quotes
 ## Notes
 - Render's free tier "sleeps" after 15 minutes of no traffic — the first request after that can take ~30 seconds while it wakes up. That's normal for a free tier.
 - You can change the model in `server.js` (the `model:` line) if you want a cheaper/faster or more capable option.
+
+## 5. Accounts (Postgres database) — for later, when you're ready
+This backend also supports student accounts (register/login) and saving each student's exam scores, study plans, and solved problems so they see them again next time they log in. To turn this on:
+
+1. On Render, click "New +" → "PostgreSQL". Create a free database.
+2. Once created, Render shows an "Internal Database URL" — copy it.
+3. Go back to your web service (`physics-tutor-backend`) → "Environment" → add:
+   - Key: `DATABASE_URL`, Value: (the URL from step 2)
+   - Key: `JWT_SECRET`, Value: any long random string you make up (e.g. mash your keyboard)
+4. Redeploy the web service (Manual Deploy → Deploy latest commit).
+5. The required tables are created automatically the first time the server starts — no manual database setup needed.
