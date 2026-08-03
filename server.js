@@ -153,6 +153,47 @@ app.get('/api/my/history', requireAuth, async (req, res) => {
   }
 });
 
+// --- Admin ---
+// Set ADMIN_EMAIL in the environment to the email of the account that should have admin access.
+function requireAdmin(req, res, next){
+  if (!req.user) return res.status(401).json({ error: 'Please log in first.' });
+  const adminEmail = (process.env.ADMIN_EMAIL || '').toLowerCase();
+  if (!adminEmail || req.user.email.toLowerCase() !== adminEmail) {
+    return res.status(403).json({ error: 'You do not have admin access.' });
+  }
+  next();
+}
+
+app.get('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
+  if (!pool) return res.status(500).json({ error: 'No database connected on the server yet.' });
+  try {
+    const result = await pool.query(`
+      SELECT
+        u.id, u.name, u.email, u.created_at,
+        (SELECT COUNT(*) FROM exam_results WHERE user_id = u.id) AS exam_count,
+        (SELECT COUNT(*) FROM study_plans WHERE user_id = u.id) AS plan_count,
+        (SELECT COUNT(*) FROM solver_history WHERE user_id = u.id) AS solve_count
+      FROM users u
+      ORDER BY u.created_at DESC
+    `);
+    res.json({ users: result.rows });
+  } catch (err) {
+    console.error('Admin users fetch error:', err);
+    res.status(500).json({ error: 'Could not load users.' });
+  }
+});
+
+app.delete('/api/admin/users/:id', requireAuth, requireAdmin, async (req, res) => {
+  if (!pool) return res.status(500).json({ error: 'No database connected on the server yet.' });
+  try {
+    await pool.query('DELETE FROM users WHERE id = $1', [req.params.id]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Admin delete user error:', err);
+    res.status(500).json({ error: 'Could not delete this user.' });
+  }
+});
+
 const SYSTEM_PROMPT = `You are a physics tutor for Lebanese high school students (Lebanese national curriculum, grades 9-12 / Brevet-Bac).
 When given a physics problem:
 1. Identify the relevant law/formula.
