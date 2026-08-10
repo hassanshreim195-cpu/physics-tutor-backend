@@ -7,7 +7,7 @@ require('dotenv').config();
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 // --- Database setup ---
 // DATABASE_URL is provided automatically by Render when you attach a Postgres database.
@@ -194,8 +194,74 @@ app.delete('/api/admin/users/:id', requireAuth, requireAdmin, async (req, res) =
   }
 });
 
+// --- AI (Groq / Llama 3.1 for text; Gemini for the solver, since it can read photos) ---
+// Set GROQ_API_KEY and GEMINI_API_KEY in the environment. Both have generous free tiers.
+const GROQ_MODEL = 'llama-3.1-8b-instant';
+const GEMINI_MODEL = 'gemini-2.5-flash';
+
+async function callGroq(systemPrompt, userMessage, maxTokens){
+  const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer ' + process.env.GROQ_API_KEY,
+    },
+    body: JSON.stringify({
+      model: GROQ_MODEL,
+      max_tokens: maxTokens,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userMessage },
+      ],
+    }),
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    console.error('Groq API error:', errText);
+    throw new Error('groq_error');
+  }
+
+  const data = await response.json();
+  return (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '';
+}
+
+// Calls Gemini with text, and optionally an image (for the photo solver).
+async function callGemini(systemPrompt, userText, image){
+  const parts = [];
+  if (image && image.data && image.media_type) {
+    parts.push({ inline_data: { mime_type: image.media_type, data: image.data } });
+  }
+  parts.push({ text: userText || 'Solve the physics problem shown in this photo, step by step.' });
+
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': process.env.GEMINI_API_KEY,
+      },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: systemPrompt }] },
+        contents: [{ parts }],
+      }),
+    }
+  );
+
+  if (!response.ok) {
+    const errText = await response.text();
+    console.error('Gemini API error:', errText);
+    throw new Error('gemini_error');
+  }
+
+  const data = await response.json();
+  const candidateParts = (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [];
+  return candidateParts.map(p => p.text || '').join('\n');
+}
+
 const SYSTEM_PROMPT = `You are a physics tutor for Lebanese high school students (Lebanese national curriculum, grades 9-12 / Brevet-Bac).
-When given a physics problem:
+When given a physics problem (as text, or shown in a photo):
 1. Identify the relevant law/formula.
 2. Solve step by step, showing each calculation.
 3. If the student's own attempt is included and contains a mistake, point out exactly where the mistake is and correct it.
@@ -212,46 +278,12 @@ app.post('/api/solve', async (req, res) => {
     return res.status(400).json({ error: 'Please send a physics problem in the "problem" field, or attach an image.' });
   }
 
-  if (!process.env.ANTHROPIC_API_KEY) {
-    return res.status(500).json({ error: 'Server is missing its API key. Set ANTHROPIC_API_KEY in the environment.' });
+  if (!process.env.GEMINI_API_KEY) {
+    return res.status(500).json({ error: 'Server is missing its API key. Set GEMINI_API_KEY in the environment.' });
   }
-
-  const content = [];
-  if (image && image.data && image.media_type) {
-    content.push({
-      type: 'image',
-      source: { type: 'base64', media_type: image.media_type, data: image.data },
-    });
-  }
-  content.push({ type: 'text', text: problem && problem.trim() ? problem : 'Solve the physics problem shown in this photo, step by step.' });
 
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-5',
-        max_tokens: 700,
-        system: SYSTEM_PROMPT,
-        messages: [{ role: 'user', content }],
-      }),
-    });
-
-    if (!response.ok) {
-      const errText = await response.text();
-      console.error('Anthropic API error:', errText);
-      return res.status(502).json({ error: 'The AI service returned an error. Check the server logs.' });
-    }
-
-    const data = await response.json();
-    const solution = (data.content || [])
-      .filter((block) => block.type === 'text')
-      .map((block) => block.text)
-      .join('\n');
+    const solution = await callGemini(SYSTEM_PROMPT, problem, image);
 
     if (pool && req.user) {
       pool.query(
@@ -262,6 +294,9 @@ app.post('/api/solve', async (req, res) => {
 
     res.json({ solution: solution || 'No solution returned.' });
   } catch (err) {
+    if (err.message === 'gemini_error') {
+      return res.status(502).json({ error: 'The AI service returned an error. Check the server logs.' });
+    }
     console.error('Server error:', err);
     res.status(500).json({ error: 'Something went wrong on the server.' });
   }
@@ -284,8 +319,8 @@ app.post('/api/study-plan', async (req, res) => {
     return res.status(400).json({ error: 'Please provide the grade, exam date, and lessons left.' });
   }
 
-  if (!process.env.ANTHROPIC_API_KEY) {
-    return res.status(500).json({ error: 'Server is missing its API key. Set ANTHROPIC_API_KEY in the environment.' });
+  if (!process.env.GROQ_API_KEY) {
+    return res.status(500).json({ error: 'Server is missing its API key. Set GROQ_API_KEY in the environment.' });
   }
 
   const userMessage = `Grade/branch: ${grade}
@@ -299,32 +334,7 @@ Other exams around the same time: ${otherExams && otherExams.trim() ? otherExams
 Build my physics study plan.`;
 
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-5',
-        max_tokens: 900,
-        system: STUDY_PLAN_SYSTEM_PROMPT,
-        messages: [{ role: 'user', content: userMessage }],
-      }),
-    });
-
-    if (!response.ok) {
-      const errText = await response.text();
-      console.error('Anthropic API error:', errText);
-      return res.status(502).json({ error: 'The AI service returned an error. Check the server logs.' });
-    }
-
-    const data = await response.json();
-    const plan = (data.content || [])
-      .filter((block) => block.type === 'text')
-      .map((block) => block.text)
-      .join('\n');
+    const plan = await callGroq(STUDY_PLAN_SYSTEM_PROMPT, userMessage, 900);
 
     if (pool && req.user) {
       pool.query(
@@ -335,6 +345,9 @@ Build my physics study plan.`;
 
     res.json({ plan: plan || 'No plan returned.' });
   } catch (err) {
+    if (err.message === 'groq_error') {
+      return res.status(502).json({ error: 'The AI service returned an error. Check the server logs.' });
+    }
     console.error('Server error:', err);
     res.status(500).json({ error: 'Something went wrong on the server.' });
   }
@@ -368,37 +381,15 @@ app.post('/api/generate-exam', async (req, res) => {
   if (!grade) {
     return res.status(400).json({ error: 'Please provide the grade.' });
   }
-  if (!process.env.ANTHROPIC_API_KEY) {
-    return res.status(500).json({ error: 'Server is missing its API key. Set ANTHROPIC_API_KEY in the environment.' });
+  if (!process.env.GROQ_API_KEY) {
+    return res.status(500).json({ error: 'Server is missing its API key. Set GROQ_API_KEY in the environment.' });
   }
 
   const lessonList = Array.isArray(lessons) && lessons.length ? lessons.join(', ') : 'general physics topics for this grade';
   const userMessage = `Grade/branch: ${grade}\nLessons to draw questions from: ${lessonList}`;
 
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-5',
-        max_tokens: 500,
-        system: EXAM_GEN_SYSTEM_PROMPT,
-        messages: [{ role: 'user', content: userMessage }],
-      }),
-    });
-
-    if (!response.ok) {
-      const errText = await response.text();
-      console.error('Anthropic API error:', errText);
-      return res.status(502).json({ error: 'The AI service returned an error. Check the server logs.' });
-    }
-
-    const data = await response.json();
-    const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n');
+    const text = await callGroq(EXAM_GEN_SYSTEM_PROMPT, userMessage, 800);
     let questions;
     try {
       questions = extractJson(text);
@@ -408,6 +399,9 @@ app.post('/api/generate-exam', async (req, res) => {
     }
     res.json({ questions });
   } catch (err) {
+    if (err.message === 'groq_error') {
+      return res.status(502).json({ error: 'The AI service returned an error. Check the server logs.' });
+    }
     console.error('Server error:', err);
     res.status(500).json({ error: 'Something went wrong on the server.' });
   }
@@ -419,8 +413,8 @@ app.post('/api/grade-exam', async (req, res) => {
   if (!grade || !Array.isArray(questions) || !Array.isArray(answers) || questions.length !== answers.length) {
     return res.status(400).json({ error: 'Please provide matching questions and answers.' });
   }
-  if (!process.env.ANTHROPIC_API_KEY) {
-    return res.status(500).json({ error: 'Server is missing its API key. Set ANTHROPIC_API_KEY in the environment.' });
+  if (!process.env.GROQ_API_KEY) {
+    return res.status(500).json({ error: 'Server is missing its API key. Set GROQ_API_KEY in the environment.' });
   }
 
   const pairs = questions.map((q, i) => {
@@ -432,29 +426,7 @@ app.post('/api/grade-exam', async (req, res) => {
   const userMessage = `Grade/branch: ${grade}\n\n${pairs}`;
 
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-5',
-        max_tokens: 800,
-        system: EXAM_GRADE_SYSTEM_PROMPT,
-        messages: [{ role: 'user', content: userMessage }],
-      }),
-    });
-
-    if (!response.ok) {
-      const errText = await response.text();
-      console.error('Anthropic API error:', errText);
-      return res.status(502).json({ error: 'The AI service returned an error. Check the server logs.' });
-    }
-
-    const data = await response.json();
-    const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n');
+    const text = await callGroq(EXAM_GRADE_SYSTEM_PROMPT, userMessage, 900);
     let results;
     try {
       results = extractJson(text);
@@ -473,6 +445,9 @@ app.post('/api/grade-exam', async (req, res) => {
 
     res.json({ results });
   } catch (err) {
+    if (err.message === 'groq_error') {
+      return res.status(502).json({ error: 'The AI service returned an error. Check the server logs.' });
+    }
     console.error('Server error:', err);
     res.status(500).json({ error: 'Something went wrong on the server.' });
   }
