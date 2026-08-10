@@ -1,18 +1,30 @@
 # Physics tutor backend
 
-This tiny server is what makes the "Try the solver" box on the website actually work.
-It keeps your Anthropic API key private on the server — the website never sees it.
+This tiny server is what makes the AI features on the website actually work (solver, study plan, practice exam).
+It keeps your API keys private on the server — the website never sees them.
+
+Both APIs used here are **free**:
+- **Groq** (running Meta's Llama 3.1) — powers the study plan and practice exam (text only).
+- **Gemini** (Google) — powers the solver, including reading photos of problems.
 
 ## What it does
-- Receives a physics problem from the website
-- Sends it to Claude with instructions to solve it step by step (Lebanese curriculum style)
+- Receives a physics problem (text or photo) from the website
+- Sends it to the AI with instructions to solve it step by step (Lebanese curriculum style)
 - Sends the solution back to the website to display
 
-## 1. Get an API key
-1. Go to https://console.anthropic.com and create an account (or log in).
-2. Go to "API Keys" and create a new key.
-3. Copy it somewhere safe — you'll paste it into Render in step 3 below, not into any file you upload.
-4. Add a small amount of credit to the account (Billing section) — the API is pay-as-you-go, very cheap per question.
+## 1. Get your two free API keys
+
+**Groq (for study plan & exam):**
+1. Go to https://console.groq.com and create a free account (no credit card needed).
+2. Go to "API Keys" → "Create API Key".
+3. Copy it somewhere safe (starts with `gsk_...`).
+
+**Gemini (for the solver, including photos):**
+1. Go to https://aistudio.google.com/apikey and sign in with a Google account.
+2. Click "Create API key" (no credit card needed for the free tier).
+3. Copy it somewhere safe.
+
+You'll paste both into Render in step 3 below — never into any file you upload to GitHub.
 
 ## 2. Put this code on GitHub
 1. Create a free account at https://github.com if you don't have one.
@@ -27,8 +39,8 @@ It keeps your Anthropic API key private on the server — the website never sees
    - Build command: `npm install`
    - Start command: `npm start`
 5. Under "Environment Variables", add:
-   - Key: `ANTHROPIC_API_KEY`
-   - Value: (paste the key you copied in step 1)
+   - Key: `GROQ_API_KEY`, Value: (the Groq key from step 1)
+   - Key: `GEMINI_API_KEY`, Value: (the Gemini key from step 1)
 6. Click "Create Web Service". Wait a few minutes for it to deploy.
 7. Render will give you a URL like `https://physics-tutor-backend-xxxx.onrender.com` — copy it.
 
