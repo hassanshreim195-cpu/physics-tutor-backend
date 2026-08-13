@@ -197,7 +197,7 @@ app.delete('/api/admin/users/:id', requireAuth, requireAdmin, async (req, res) =
 // --- AI (Groq / Llama 3.1 for text; Gemini for the solver, since it can read photos) ---
 // Set GROQ_API_KEY and GEMINI_API_KEY in the environment. Both have generous free tiers.
 const GROQ_MODEL = 'llama-3.1-8b-instant';
-const GEMINI_MODEL = 'gemini-2.5-flash';
+const GEMINI_MODEL = 'gemini-3.6-flash';
 
 async function callGroq(systemPrompt, userMessage, maxTokens){
   const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
@@ -260,6 +260,14 @@ async function callGemini(systemPrompt, userText, image){
   return candidateParts.map(p => p.text || '').join('\n');
 }
 
+// If the site is set to French, tell the AI to answer in French.
+function withLanguage(prompt, lang){
+  if (lang === 'fr') {
+    return prompt + '\n\nIMPORTANT: Respond entirely in French, including all explanations, headings, and labels.';
+  }
+  return prompt;
+}
+
 const SYSTEM_PROMPT = `You are a physics tutor for Lebanese high school students (Lebanese national curriculum, grades 9-12 / Brevet-Bac).
 When given a physics problem (as text, or shown in a photo):
 1. Identify the relevant law/formula.
@@ -272,7 +280,7 @@ app.get('/', (req, res) => {
 });
 
 app.post('/api/solve', async (req, res) => {
-  const { problem, image } = req.body;
+  const { problem, image, lang } = req.body;
 
   if ((!problem || typeof problem !== 'string' || !problem.trim()) && !image) {
     return res.status(400).json({ error: 'Please send a physics problem in the "problem" field, or attach an image.' });
@@ -283,7 +291,7 @@ app.post('/api/solve', async (req, res) => {
   }
 
   try {
-    const solution = await callGemini(SYSTEM_PROMPT, problem, image);
+    const solution = await callGemini(withLanguage(SYSTEM_PROMPT, lang), problem, image);
 
     if (pool && req.user) {
       pool.query(
@@ -313,7 +321,7 @@ Build a clear, realistic day-by-day (or every-2-3-days if there are many days) s
 Keep the tone encouraging but realistic. Format as a simple day-by-day list.`;
 
 app.post('/api/study-plan', async (req, res) => {
-  const { grade, examDate, daysLeft, lessons, otherExams } = req.body;
+  const { grade, examDate, daysLeft, lessons, otherExams, lang } = req.body;
 
   if (!grade || daysLeft === undefined || !lessons) {
     return res.status(400).json({ error: 'Please provide the grade, exam date, and lessons left.' });
@@ -334,7 +342,7 @@ Other exams around the same time: ${otherExams && otherExams.trim() ? otherExams
 Build my physics study plan.`;
 
   try {
-    const plan = await callGroq(STUDY_PLAN_SYSTEM_PROMPT, userMessage, 900);
+    const plan = await callGroq(withLanguage(STUDY_PLAN_SYSTEM_PROMPT, lang), userMessage, 900);
 
     if (pool && req.user) {
       pool.query(
@@ -376,7 +384,7 @@ function extractJson(text){
 }
 
 app.post('/api/generate-exam', async (req, res) => {
-  const { grade, lessons } = req.body;
+  const { grade, lessons, lang } = req.body;
 
   if (!grade) {
     return res.status(400).json({ error: 'Please provide the grade.' });
@@ -389,7 +397,7 @@ app.post('/api/generate-exam', async (req, res) => {
   const userMessage = `Grade/branch: ${grade}\nLessons to draw questions from: ${lessonList}`;
 
   try {
-    const text = await callGroq(EXAM_GEN_SYSTEM_PROMPT, userMessage, 800);
+    const text = await callGroq(withLanguage(EXAM_GEN_SYSTEM_PROMPT, lang), userMessage, 800);
     let questions;
     try {
       questions = extractJson(text);
@@ -408,7 +416,7 @@ app.post('/api/generate-exam', async (req, res) => {
 });
 
 app.post('/api/grade-exam', async (req, res) => {
-  const { grade, questions, answers } = req.body;
+  const { grade, questions, answers, lang } = req.body;
 
   if (!grade || !Array.isArray(questions) || !Array.isArray(answers) || questions.length !== answers.length) {
     return res.status(400).json({ error: 'Please provide matching questions and answers.' });
@@ -426,7 +434,7 @@ app.post('/api/grade-exam', async (req, res) => {
   const userMessage = `Grade/branch: ${grade}\n\n${pairs}`;
 
   try {
-    const text = await callGroq(EXAM_GRADE_SYSTEM_PROMPT, userMessage, 900);
+    const text = await callGroq(withLanguage(EXAM_GRADE_SYSTEM_PROMPT, lang), userMessage, 900);
     let results;
     try {
       results = extractJson(text);
