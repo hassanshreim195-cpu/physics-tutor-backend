@@ -885,7 +885,11 @@ app.get('/api/admin/analytics', requireAuth, requireAdmin, async (req, res) => {
 
 // --- AI (Groq / Llama 3.1 for text; Gemini for the solver, since it can read photos) ---
 // Set GROQ_API_KEY and GEMINI_API_KEY in the environment. Both have generous free tiers.
-const GROQ_MODEL = 'llama-3.1-8b-instant';
+// llama-3.1-8b-instant was deprecated and shut down by Groq on Aug 16, 2026 — every route
+// calling it (exam/question-bank/formula generation, study plan, grading, topic
+// classification) started failing with a "model_not_found" error at that point. Switched to
+// Groq's own recommended replacement.
+const GROQ_MODEL = 'openai/gpt-oss-20b';
 const GEMINI_MODEL = 'gemini-2.5-flash';
 
 async function callGroq(systemPrompt, userMessage, maxTokens){
