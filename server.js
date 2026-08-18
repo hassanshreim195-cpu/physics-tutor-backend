@@ -40,7 +40,9 @@ app.use(cors({
     }
   }
 }));
-app.use(express.json({ limit: '10mb' }));
+// Raised from 10mb: Practice Exam now sends one photo per "big problem" (up to 5 problems
+// in one grading request), so a single submission can carry several MB of images at once.
+app.use(express.json({ limit: '25mb' }));
 
 // --- Simple in-memory rate limiting (no external dependency needed) ---
 // Keyed by IP address. Each limiter instance keeps its own bucket map and
@@ -787,6 +789,97 @@ app.patch('/api/admin/bookings/:id', requireAuth, requireAdmin, async (req, res)
   }
 });
 
+// GET /api/admin/analytics — a class-wide (not per-student) view: how each grade is doing on
+// average, the most common mistake types per grade, and each grade's weakest topics. This is
+// the teacher-facing counterpart to the student Dashboard, which only ever shows one student
+// at a time. Every query is grouped by grade — no single-student drill-down here, that's what
+// /api/admin/users is for.
+app.get('/api/admin/analytics', requireAuth, requireAdmin, async (req, res) => {
+  if (!pool) return res.status(500).json({ error: 'No database connected on the server yet.' });
+  try {
+    const [examStats, mistakeStats, topicStats, overall] = await Promise.all([
+      // Average Practice Exam score per grade. Note: `grade` here is whatever was stored on
+      // exam_results at submit time — student-facing routes always send the raw curriculum
+      // key (e.g. "g9") going forward, but a handful of very old rows (from before that was
+      // fixed) may carry a human label instead. Shown as-is; harmless, just an odd label.
+      pool.query(`
+        SELECT grade, COUNT(*) AS exam_count,
+          ROUND(AVG(CASE WHEN total > 0 THEN score::float / total * 100 END)::numeric, 1) AS avg_score_pct
+        FROM exam_results
+        WHERE grade IS NOT NULL
+        GROUP BY grade
+        ORDER BY grade
+      `),
+      // Every incorrect, tagged attempt across every source (exam/question_bank/lab/diagnostic),
+      // grouped by grade + mistake tag — the raw material for "top mistakes per grade" below.
+      pool.query(`
+        SELECT t.grade, a.mistake_tag, COUNT(*) AS cnt
+        FROM attempts a JOIN topics t ON t.id = a.topic_id
+        WHERE a.correct = false AND a.mistake_tag IS NOT NULL
+        GROUP BY t.grade, a.mistake_tag
+        ORDER BY t.grade, cnt DESC
+      `),
+      // Per-topic mastery averaged across the WHOLE grade (not one student) — same >=3-attempt
+      // minimum-sample-size rule used everywhere else in the unified attempts model.
+      pool.query(`
+        SELECT t.grade, t.title AS topic, COUNT(*) AS attempts,
+          ROUND(AVG(CASE WHEN a.correct THEN 100 ELSE 0 END)::numeric, 1) AS mastery_pct
+        FROM attempts a JOIN topics t ON t.id = a.topic_id
+        GROUP BY t.grade, t.title
+        HAVING COUNT(*) >= 3
+        ORDER BY t.grade, mastery_pct ASC
+      `),
+      pool.query(`
+        SELECT
+          (SELECT COUNT(*) FROM users) AS student_count,
+          (SELECT COUNT(*) FROM attempts) AS attempt_count,
+          (SELECT COUNT(*) FROM exam_results) AS exam_count,
+          (SELECT ROUND(AVG(CASE WHEN correct THEN 100 ELSE 0 END)::numeric, 1) FROM attempts WHERE correct IS NOT NULL) AS overall_correct_pct
+      `),
+    ]);
+
+    // Top 5 mistake tags per grade, already ordered by count from the query above.
+    const mistakesByGrade = {};
+    mistakeStats.rows.forEach(r => {
+      const grade = r.grade;
+      mistakesByGrade[grade] = mistakesByGrade[grade] || [];
+      if (mistakesByGrade[grade].length < 5) {
+        mistakesByGrade[grade].push({ tag: shortTagLabel(r.mistake_tag), count: Number(r.cnt) });
+      }
+    });
+
+    // Weakest 3 topics per grade (lowest mastery first, already ordered by the query above).
+    const weakTopicsByGrade = {};
+    topicStats.rows.forEach(r => {
+      const grade = r.grade;
+      weakTopicsByGrade[grade] = weakTopicsByGrade[grade] || [];
+      if (weakTopicsByGrade[grade].length < 3) {
+        weakTopicsByGrade[grade].push({ topic: r.topic, masteryPct: Number(r.mastery_pct), attempts: Number(r.attempts) });
+      }
+    });
+
+    const overallRow = overall.rows[0] || {};
+    res.json({
+      overall: {
+        studentCount: Number(overallRow.student_count) || 0,
+        attemptCount: Number(overallRow.attempt_count) || 0,
+        examCount: Number(overallRow.exam_count) || 0,
+        overallCorrectPct: overallRow.overall_correct_pct !== null && overallRow.overall_correct_pct !== undefined ? Number(overallRow.overall_correct_pct) : null,
+      },
+      examStatsByGrade: examStats.rows.map(r => ({
+        grade: r.grade,
+        examCount: Number(r.exam_count),
+        avgScorePct: r.avg_score_pct !== null ? Number(r.avg_score_pct) : null,
+      })),
+      mistakesByGrade,
+      weakTopicsByGrade,
+    });
+  } catch (err) {
+    console.error('Admin analytics fetch error:', err);
+    res.status(500).json({ error: 'Could not load analytics.' });
+  }
+});
+
 // --- AI (Groq / Llama 3.1 for text; Gemini for the solver, since it can read photos) ---
 // Set GROQ_API_KEY and GEMINI_API_KEY in the environment. Both have generous free tiers.
 const GROQ_MODEL = 'llama-3.1-8b-instant';
@@ -1032,18 +1125,50 @@ Build my physics study plan.`;
   }
 });
 
-const EXAM_GEN_SYSTEM_PROMPT = `You are a physics exam writer for a Lebanese high school student.
-Given a grade/branch and a specific list of lesson/chapter names the student chose to be tested on, write exactly 5 exam questions covering those lessons, ordered from easiest to hardest (progressive difficulty).
-Use a mix of question types across the 5 questions: at least one True/False, at least one multiple-choice, and at least one problem/calculation question (short-answer, not essay).
-Respond with ONLY a JSON array of 5 objects, nothing else — no markdown, no preamble. Each object must have:
-- "type": one of "tf", "mcq", "problem"
-- "question": the question text
-- "choices": an array of 3-4 answer options (ONLY include this field for "mcq" type; omit it for "tf" and "problem")
-- "topic": the EXACT lesson name (copied verbatim, character-for-character) from the given lesson list that this question belongs to — never invent or paraphrase a topic name
-- "difficulty": one of "easy", "medium", "hard"
-Example:
-[{"type":"tf","question":"...","topic":"Newton's 2nd Law and its Applications","difficulty":"easy"},{"type":"mcq","question":"...","choices":["A","B","C","D"],"topic":"...","difficulty":"medium"},{"type":"problem","question":"...","topic":"...","difficulty":"hard"}]`;
+// Practice Exam: the student picks a grade + lessons, gets a small set of FULL, multi-part
+// "big problems" (scenario + lettered sub-questions), the way an official Lebanese
+// Baccalaureate/Brevet physics exam is actually structured — not a pile of isolated
+// tf/mcq/short-answer questions (that format lives on in Question Bank, unchanged).
+// How many problems to generate is sized to how long a practice sitting for that grade is
+// meant to represent: grades 7-10, Grade 11 Literary, and Grade 12 SE/Literature are treated
+// as the 1-hour set; Grade 11 Scientific and Grade 12 Life Sciences/General Sciences are the
+// 2-hour set. (Grade 11 Literary isn't explicitly split by the teacher's own duration split —
+// grouped with the 1-hour set as the non-science-heavy stream at that level; easy to move to
+// the other bucket if that's wrong.)
+const EXAM_PROBLEM_COUNT = {
+  g7: 3, g8: 3, g9: 3, g10: 3, g11lit: 3, bacse: 3,
+  g11sci: 5, bacls: 5, bacgs: 5,
+};
+function examProblemCountFor(grade){
+  return EXAM_PROBLEM_COUNT[grade] || 3;
+}
 
+// Friendlier label for the AI prompt only — `grade` itself stays the raw curriculum key
+// (e.g. "g9") everywhere else (DB lookups, topic resolution), matching Question Bank/Lab/etc.
+const GRADE_LABELS = {
+  g7: 'Grade 7', g8: 'Grade 8', g9: 'Grade 9 — Brevet', g10: 'Grade 10',
+  g11sci: 'Grade 11 — Scientific', g11lit: 'Grade 11 — Literary',
+  bacse: 'Grade 12 — SE / Literature', bacls: 'Grade 12 — Life Sciences', bacgs: 'Grade 12 — General Sciences',
+};
+
+const EXAM_GEN_SYSTEM_PROMPT = `You are a physics exam writer for a Lebanese high school student, writing a FULL-LENGTH practice exam in the style of an official Lebanese Baccalaureate/Brevet physics exam — not a set of short isolated questions.
+Given a grade/branch, a specific list of lesson/chapter names the student chose to be tested on, and how many big problems to write, write exactly that many comprehensive multi-part problems, ordered from easiest to hardest overall.
+Each problem should:
+- Present a realistic physical scenario/setup (1-3 sentences — concrete numbers, objects, a situation), then walk the student through it via several lettered sub-questions ("parts"), the way real exam problems are structured (e.g. a) find X, b) use your answer to (a) to find Y, c) explain/interpret the result...).
+- Have 3-5 parts, building logically where it makes sense (later parts may depend on earlier answers), mixing calculation parts with at least one short conceptual/explanation part.
+- Be based on ONE of the given lessons (pick the best-fitting one). If asked for more than one problem, spread them across different lessons from the list rather than repeating the same lesson.
+Respond with ONLY a JSON array, nothing else — no markdown, no preamble. Each object must have:
+- "topic": the EXACT lesson name (copied verbatim, character-for-character) from the given lesson list that this problem is primarily about — never invent or paraphrase a topic name
+- "difficulty": one of "easy", "medium", "hard"
+- "scenario": the shared context/setup text for this problem
+- "parts": an array of objects, each with "label" (a single letter — "a", "b", "c", ...) and "question" (that part's question text)
+Example:
+[{"topic":"Motion of a Particle in a Plane","difficulty":"easy","scenario":"A ball is launched from ground level at 20 m/s at 30° above the horizontal (g = 9.8 m/s²).","parts":[{"label":"a","question":"Find the time it takes the ball to reach its maximum height."},{"label":"b","question":"Find the maximum height reached."},{"label":"c","question":"Find the total horizontal range."}]}]`;
+
+// Used by /api/question-bank/grade (unchanged format there: a list of small tf/mcq/problem
+// questions, graded together in one text-only Groq call). Practice Exam grading now uses its
+// own vision-based prompt below (EXAM_PROBLEM_GRADE_SYSTEM_PROMPT) — kept separate so the two
+// features don't fight over one shared prompt/format.
 const EXAM_GRADE_SYSTEM_PROMPT = `You are a physics teacher grading a Lebanese high school student's exam.
 You will be given a list of questions (each with a type: "tf", "mcq", or "problem"; mcq ones include their choices; each question also lists its topic and, if the topic is a known one, the exact set of allowed mistake tags for that topic) and the student's answers, in the same order.
 For each question, decide if the student's answer is correct — for "tf" and "mcq" compare against the correct option; for "problem" allow reasonable equivalent phrasing/units, don't require exact wording. Write short (1-2 sentence) feedback explaining why, and the correct answer if they got it wrong.
@@ -1051,6 +1176,16 @@ If the answer is INCORRECT, also pick exactly one "mistake_tag" from that questi
 Respond with ONLY a JSON array of objects, nothing else — no markdown, no preamble. Format:
 [{"correct": true, "feedback": "short explanation"}, {"correct": false, "feedback": "short explanation with the correct answer", "mistake_tag": "one-of-the-allowed-tags"}]
 The array must have exactly as many objects as there are questions, in the same order.`;
+
+// Practice Exam grading is now per-problem and vision-based: the student photographs their
+// handwritten work for one whole problem (all its parts together) instead of typing answers,
+// so this prompt grades ONE problem at a time from a photo, matching a single Gemini vision call.
+const EXAM_PROBLEM_GRADE_SYSTEM_PROMPT = `You are a physics teacher grading ONE problem from a Lebanese high school student's practice exam. You will be given the problem (its topic, scenario, and lettered parts) and a PHOTO of the student's handwritten solution to this problem. The photo may show messy handwriting, crossed-out work, and work for multiple parts together — read it carefully and match each piece of the student's work to the corresponding lettered part of the problem.
+For EACH part, decide if the student's answer/reasoning for that part is correct — allow reasonable equivalent phrasing, rounding, and units, don't require exact wording or exact decimal precision. Write short (1-2 sentence) feedback per part explaining why, and the correct answer/approach if they got it wrong. If a part was left blank or is illegible, mark it incorrect and say so plainly.
+If a part is INCORRECT, also pick exactly one "mistake_tag" from the allowed list for this problem's topic that best describes the kind of error — use "other" only if none of the specific tags fit. If a part is correct, omit "mistake_tag" (or set it to null).
+Respond with ONLY a single JSON object, nothing else — no markdown, no preamble. Format:
+{"parts": [{"label": "a", "correct": true, "feedback": "short explanation"}, {"label": "b", "correct": false, "feedback": "short explanation with the correct approach/answer", "mistake_tag": "one-of-the-allowed-tags"}], "overall_feedback": "one short encouraging sentence about this problem as a whole"}
+The "parts" array must have exactly as many objects as the problem has parts, in the same order, matching each "label".`;
 
 function extractJson(text){
   const match = text.match(/\[[\s\S]*\]/);
@@ -1071,18 +1206,19 @@ app.post('/api/generate-exam', aiLimiter, async (req, res) => {
   // topic names to copy into "topic" — never a vague "general topics" placeholder.
   const chosenLessons = Array.isArray(lessons) && lessons.length ? lessons : CURRICULUM[grade];
   const lessonList = chosenLessons && chosenLessons.length ? chosenLessons.join(', ') : 'general physics topics for this grade';
-  const userMessage = `Grade/branch: ${grade}\nLessons to draw questions from (use these EXACT names for "topic"): ${lessonList}`;
+  const problemCount = examProblemCountFor(grade);
+  const userMessage = `Grade/branch: ${GRADE_LABELS[grade] || grade}\nLessons to draw problems from (use these EXACT names for "topic"): ${lessonList}\nNumber of big problems to write: ${problemCount}`;
 
   try {
-    const text = await callGroq(withLanguage(EXAM_GEN_SYSTEM_PROMPT, lang), userMessage, 800);
-    let questions;
+    const text = await callGroq(withLanguage(EXAM_GEN_SYSTEM_PROMPT, lang), userMessage, Math.min(3500, 500 + problemCount * 550));
+    let problems;
     try {
-      questions = extractJson(text);
+      problems = extractJson(text);
     } catch (e) {
-      console.error('Failed to parse exam questions JSON:', text);
+      console.error('Failed to parse exam problems JSON:', text);
       return res.status(502).json({ error: 'Could not generate a valid exam. Try again.' });
     }
-    res.json({ questions });
+    res.json({ problems });
   } catch (err) {
     if (err.message === 'groq_error') {
       return res.status(502).json({ error: 'The AI service returned an error. Check the server logs.' });
@@ -1093,56 +1229,64 @@ app.post('/api/generate-exam', aiLimiter, async (req, res) => {
 });
 
 app.post('/api/grade-exam', aiLimiter, async (req, res) => {
-  // timeSpent is optional for now — an array of seconds per question, same order as
-  // questions/answers. The frontend doesn't send this yet (instrumentation is a separate
-  // step); when absent every attempt is saved with time_spent_seconds = null.
-  const { grade, questions, answers, lang, timeSpent } = req.body;
+  // timeSpent is optional — an array of seconds per PROBLEM (not per part), same order as
+  // `problems`. When absent every attempt is saved with time_spent_seconds = null.
+  const { grade, problems, lang, timeSpent } = req.body;
 
-  if (!grade || !Array.isArray(questions) || !Array.isArray(answers) || questions.length !== answers.length) {
-    return res.status(400).json({ error: 'Please provide matching questions and answers.' });
+  if (!grade || !Array.isArray(problems) || !problems.length) {
+    return res.status(400).json({ error: 'Please provide the grade and at least one problem.' });
   }
-  if (!process.env.GROQ_API_KEY) {
-    return res.status(500).json({ error: 'Server is missing its API key. Set GROQ_API_KEY in the environment.' });
+  if (problems.some(p => !p || !Array.isArray(p.parts) || !p.parts.length)) {
+    return res.status(400).json({ error: 'Each problem must include its parts.' });
   }
-
-  const pairs = questions.map((q, i) => {
-    const qText = typeof q === 'string' ? q : q.question;
-    const qType = typeof q === 'string' ? 'problem' : (q.type || 'problem');
-    const qTopic = typeof q === 'string' ? null : q.topic;
-    const choicesLine = (qType === 'mcq' && Array.isArray(q.choices)) ? `\nChoices: ${q.choices.join(', ')}` : '';
-    const topicLine = qTopic ? `\nTopic: ${qTopic}` : '';
-    const tagsLine = qTopic ? `\nAllowed mistake tags if incorrect: ${tagsForTopic(qTopic).join(', ')}` : '';
-    return `Q${i + 1} (${qType}): ${qText}${topicLine}${choicesLine}${tagsLine}\nStudent's answer: ${answers[i]}`;
-  }).join('\n\n');
-  const userMessage = `Grade/branch: ${grade}\n\n${pairs}`;
+  if (problems.some(p => !p.image || !p.image.data)) {
+    return res.status(400).json({ error: 'Please attach a photo of your work for every problem before submitting.' });
+  }
+  if (!process.env.GEMINI_API_KEY) {
+    return res.status(500).json({ error: 'Server is missing its API key. Set GEMINI_API_KEY in the environment.' });
+  }
 
   try {
-    const text = await callGroq(withLanguage(EXAM_GRADE_SYSTEM_PROMPT, lang), userMessage, 900);
-    let results;
-    try {
-      results = extractJson(text);
-    } catch (e) {
-      console.error('Failed to parse grading JSON:', text);
-      return res.status(502).json({ error: 'Could not grade the exam. Try again.' });
-    }
+    // One Gemini vision call per problem (each has its own photo), run concurrently so a
+    // 5-problem exam doesn't grade 5x slower than a 1-problem one.
+    const gradedProblems = await Promise.all(problems.map(async (p) => {
+      const partsText = p.parts.map(part => `(${part.label}) ${part.question}`).join('\n');
+      const allowedTags = tagsForTopic(p.topic).join(', ');
+      const userText = `Topic: ${p.topic || 'Unknown'}\nScenario: ${p.scenario || ''}\nParts:\n${partsText}\nAllowed mistake tags if a part is incorrect: ${allowedTags}`;
+      try {
+        const text = await callGemini(withLanguage(EXAM_PROBLEM_GRADE_SYSTEM_PROMPT, lang), userText, p.image);
+        const match = text.match(/\{[\s\S]*\}/);
+        const parsed = JSON.parse(match ? match[0] : text);
+        return {
+          parts: Array.isArray(parsed.parts) ? parsed.parts : p.parts.map(part => ({ label: part.label, correct: false, feedback: 'Could not read a result for this part.' })),
+          overall_feedback: parsed.overall_feedback || '',
+        };
+      } catch (err) {
+        console.error('Failed to grade a problem (non-fatal, marked incorrect):', err.message || err);
+        return {
+          parts: p.parts.map(part => ({ label: part.label, correct: false, feedback: 'Could not grade this part — try resubmitting.' })),
+          overall_feedback: 'Grading failed for this problem — try again.',
+        };
+      }
+    }));
 
-    const score = results.filter(r => r.correct).length;
-    const total = results.length;
-    const scorePct = total > 0 ? Math.round((score / total) * 1000) / 10 : 0;
-
-    // Exam Review: a per-mistake-type breakdown ("you lost N marks because of...") plus a
-    // recommended topic to revise next — the topic among this exam's questions with the
-    // most incorrect answers. Same short-label convention as Question Bank/Error Analysis.
+    // Score is counted at the PART level (a "big problem" is really several mini-questions),
+    // which also keeps individual mistakes granular for the mistake-tag breakdown below.
+    let correctParts = 0, totalParts = 0;
     const mistakeCounts = {};
     const topicMissCounts = {};
-    questions.forEach((q, i) => {
-      const r = results[i] || {};
-      if (r.correct) return;
-      const label = shortTagLabel(r.mistake_tag || 'other');
-      mistakeCounts[label] = (mistakeCounts[label] || 0) + 1;
-      const qTopic = typeof q === 'string' ? null : q.topic;
-      if (qTopic) topicMissCounts[qTopic] = (topicMissCounts[qTopic] || 0) + 1;
+    gradedProblems.forEach((g, pi) => {
+      const topic = problems[pi].topic;
+      g.parts.forEach(part => {
+        totalParts++;
+        if (part.correct) { correctParts++; return; }
+        const label = shortTagLabel(part.mistake_tag || 'other');
+        mistakeCounts[label] = (mistakeCounts[label] || 0) + 1;
+        if (topic) topicMissCounts[topic] = (topicMissCounts[topic] || 0) + 1;
+      });
     });
+    const scorePct = totalParts > 0 ? Math.round((correctParts / totalParts) * 1000) / 10 : 0;
+
     let recommendedTopic = null;
     let maxMisses = 0;
     Object.keys(topicMissCounts).forEach(t => {
@@ -1150,40 +1294,35 @@ app.post('/api/grade-exam', aiLimiter, async (req, res) => {
     });
     const recommendedRevision = recommendedTopic
       ? `${recommendedTopic} Revision`
-      : (scorePct >= 85 ? 'Great job — no major gaps this time.' : 'Keep practicing — review your incorrect answers above.');
+      : (scorePct >= 85 ? 'Great job — no major gaps this time.' : 'Keep practicing — review your incorrect parts above.');
 
     if (pool && req.user) {
       pool.query(
         'INSERT INTO exam_results (user_id, grade, score, total, questions) VALUES ($1, $2, $3, $4, $5)',
-        [req.user.userId, grade, score, total, JSON.stringify(questions)]
+        [req.user.userId, grade, correctParts, totalParts, JSON.stringify(problems.map(p => ({ topic: p.topic, difficulty: p.difficulty, scenario: p.scenario, parts: p.parts })))]
       ).catch(err => console.error('Failed to save exam result:', err));
 
-      // Unified data model: one `attempts` row per question, not per exam session.
-      // Fire-and-forget per row so a slow/failed insert never blocks the response the
-      // student is waiting on for their results.
-      questions.forEach((q, i) => {
-        const qText = typeof q === 'string' ? q : q.question;
-        const qTopic = typeof q === 'string' ? null : q.topic;
-        const qDifficulty = typeof q === 'string' ? null : (q.difficulty || null);
-        const r = results[i] || {};
-        const spent = Array.isArray(timeSpent) ? (Number(timeSpent[i]) || null) : null;
-
-        resolveTopicId(grade, qTopic).then(topicId => {
-          pool.query(
-            `INSERT INTO attempts
-              (user_id, source, topic_id, difficulty, question_text, student_answer, correct, mistake_tag, time_spent_seconds)
-             VALUES ($1, 'exam', $2, $3, $4, $5, $6, $7, $8)`,
-            [req.user.userId, topicId, qDifficulty, qText, answers[i], !!r.correct, r.correct ? null : (r.mistake_tag || 'other'), spent]
-          ).catch(err => console.error('Failed to save exam attempt:', err));
+      // Unified data model: one `attempts` row per PART (not per photo/problem), fire-and-forget
+      // so a slow/failed insert never blocks the response the student is waiting on.
+      problems.forEach((p, pi) => {
+        const g = gradedProblems[pi];
+        const spent = Array.isArray(timeSpent) ? (Number(timeSpent[pi]) || null) : null;
+        resolveTopicId(grade, p.topic).then(topicId => {
+          p.parts.forEach((part, parti) => {
+            const r = g.parts[parti] || {};
+            pool.query(
+              `INSERT INTO attempts
+                (user_id, source, topic_id, difficulty, question_text, student_answer, correct, mistake_tag, time_spent_seconds)
+               VALUES ($1, 'exam', $2, $3, $4, $5, $6, $7, $8)`,
+              [req.user.userId, topicId, p.difficulty || null, `(${part.label}) ${part.question}`, '(photo submission)', !!r.correct, r.correct ? null : (r.mistake_tag || 'other'), spent]
+            ).catch(err => console.error('Failed to save exam attempt:', err));
+          });
         });
       });
     }
 
-    res.json({ results, score, total, scorePct, mistakeCounts, recommendedTopic, recommendedRevision });
+    res.json({ results: gradedProblems, score: correctParts, total: totalParts, scorePct, mistakeCounts, recommendedTopic, recommendedRevision });
   } catch (err) {
-    if (err.message === 'groq_error') {
-      return res.status(502).json({ error: 'The AI service returned an error. Check the server logs.' });
-    }
     console.error('Server error:', err);
     res.status(500).json({ error: 'Something went wrong on the server.' });
   }
