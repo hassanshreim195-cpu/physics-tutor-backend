@@ -126,6 +126,12 @@ async function setupDatabase(){
   // their real grade once and can't switch freely — see the register endpoint below).
   // Nullable so accounts created before this existed (and the admin account) don't break.
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS grade TEXT;`);
+  // Additive migration: lets the teacher mark an account as a demo/test account (e.g. to
+  // show the site to someone) without it ever showing up in class analytics, the weekly
+  // digest, the teacher dashboard, or the "what to teach next" recommendation — every one of
+  // those aggregate queries excludes users flagged here. Defaults to false so every existing
+  // real student is unaffected.
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_demo BOOLEAN DEFAULT false;`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS exam_results (
       id SERIAL PRIMARY KEY,
@@ -685,7 +691,7 @@ app.get('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT
-        u.id, u.name, u.email, u.grade, u.created_at,
+        u.id, u.name, u.email, u.grade, u.created_at, COALESCE(u.is_demo, false) AS is_demo,
         (SELECT COUNT(*) FROM exam_results WHERE user_id = u.id) AS exam_count,
         (SELECT COUNT(*) FROM study_plans WHERE user_id = u.id) AS plan_count,
         (SELECT COUNT(*) FROM solver_history WHERE user_id = u.id) AS solve_count
@@ -716,6 +722,26 @@ app.patch('/api/admin/users/:id/grade', requireAuth, requireAdmin, async (req, r
   } catch (err) {
     console.error('Admin grade update error:', err);
     res.status(500).json({ error: 'Could not update this student\'s grade.' });
+  }
+});
+
+// Mark/unmark an account as a demo/test account. Use this for any account you make just to
+// show the site to someone — once flagged, nothing that account does (exams, question bank,
+// solver, etc.) is counted in Class Analytics, the Weekly Digest, the Teacher Dashboard, or
+// the "what to teach next" recommendation, so demo activity never distorts real class data.
+app.patch('/api/admin/users/:id/demo', requireAuth, requireAdmin, async (req, res) => {
+  if (!pool) return res.status(500).json({ error: 'No database connected on the server yet.' });
+  const { isDemo } = req.body;
+  try {
+    const result = await pool.query(
+      'UPDATE users SET is_demo = $1 WHERE id = $2 RETURNING id, name, email, is_demo',
+      [!!isDemo, req.params.id]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: 'Student not found.' });
+    res.json({ user: result.rows[0] });
+  } catch (err) {
+    console.error('Admin demo-flag update error:', err);
+    res.status(500).json({ error: 'Could not update this account.' });
   }
 });
 
@@ -805,20 +831,22 @@ app.get('/api/admin/analytics', requireAuth, requireAdmin, async (req, res) => {
       // exam_results at submit time — student-facing routes always send the raw curriculum
       // key (e.g. "g9") going forward, but a handful of very old rows (from before that was
       // fixed) may carry a human label instead. Shown as-is; harmless, just an odd label.
+      // Demo/test accounts (see /api/admin/users/:id/demo) are excluded from every query
+      // below — a "show the site to someone" account should never distort real class data.
       pool.query(`
-        SELECT grade, COUNT(*) AS exam_count,
-          ROUND(AVG(CASE WHEN total > 0 THEN score::float / total * 100 END)::numeric, 1) AS avg_score_pct
-        FROM exam_results
-        WHERE grade IS NOT NULL
-        GROUP BY grade
-        ORDER BY grade
+        SELECT er.grade, COUNT(*) AS exam_count,
+          ROUND(AVG(CASE WHEN er.total > 0 THEN er.score::float / er.total * 100 END)::numeric, 1) AS avg_score_pct
+        FROM exam_results er JOIN users u ON u.id = er.user_id
+        WHERE er.grade IS NOT NULL AND COALESCE(u.is_demo, false) = false
+        GROUP BY er.grade
+        ORDER BY er.grade
       `),
       // Every incorrect, tagged attempt across every source (exam/question_bank/lab/diagnostic),
       // grouped by grade + mistake tag — the raw material for "top mistakes per grade" below.
       pool.query(`
         SELECT t.grade, a.mistake_tag, COUNT(*) AS cnt
-        FROM attempts a JOIN topics t ON t.id = a.topic_id
-        WHERE a.correct = false AND a.mistake_tag IS NOT NULL
+        FROM attempts a JOIN topics t ON t.id = a.topic_id JOIN users u ON u.id = a.user_id
+        WHERE a.correct = false AND a.mistake_tag IS NOT NULL AND COALESCE(u.is_demo, false) = false
         GROUP BY t.grade, a.mistake_tag
         ORDER BY t.grade, cnt DESC
       `),
@@ -827,17 +855,18 @@ app.get('/api/admin/analytics', requireAuth, requireAdmin, async (req, res) => {
       pool.query(`
         SELECT t.grade, t.title AS topic, COUNT(*) AS attempts,
           ROUND(AVG(CASE WHEN a.correct THEN 100 ELSE 0 END)::numeric, 1) AS mastery_pct
-        FROM attempts a JOIN topics t ON t.id = a.topic_id
+        FROM attempts a JOIN topics t ON t.id = a.topic_id JOIN users u ON u.id = a.user_id
+        WHERE COALESCE(u.is_demo, false) = false
         GROUP BY t.grade, t.title
         HAVING COUNT(*) >= 3
         ORDER BY t.grade, mastery_pct ASC
       `),
       pool.query(`
         SELECT
-          (SELECT COUNT(*) FROM users) AS student_count,
-          (SELECT COUNT(*) FROM attempts) AS attempt_count,
-          (SELECT COUNT(*) FROM exam_results) AS exam_count,
-          (SELECT ROUND(AVG(CASE WHEN correct THEN 100 ELSE 0 END)::numeric, 1) FROM attempts WHERE correct IS NOT NULL) AS overall_correct_pct
+          (SELECT COUNT(*) FROM users WHERE COALESCE(is_demo, false) = false) AS student_count,
+          (SELECT COUNT(*) FROM attempts a JOIN users u ON u.id = a.user_id WHERE COALESCE(u.is_demo, false) = false) AS attempt_count,
+          (SELECT COUNT(*) FROM exam_results er JOIN users u ON u.id = er.user_id WHERE COALESCE(u.is_demo, false) = false) AS exam_count,
+          (SELECT ROUND(AVG(CASE WHEN a.correct THEN 100 ELSE 0 END)::numeric, 1) FROM attempts a JOIN users u ON u.id = a.user_id WHERE a.correct IS NOT NULL AND COALESCE(u.is_demo, false) = false) AS overall_correct_pct
       `),
     ]);
 
@@ -880,6 +909,92 @@ app.get('/api/admin/analytics', requireAuth, requireAdmin, async (req, res) => {
   } catch (err) {
     console.error('Admin analytics fetch error:', err);
     res.status(500).json({ error: 'Could not load analytics.' });
+  }
+});
+
+// Weekly Digest: unlike /api/admin/analytics (all-time totals), this is scoped to the last 7
+// days and named-student-level — the teacher asked for a way to see WHICH students are
+// struggling and on WHAT each week, not just class-wide averages, so she can check in on them
+// early instead of finding out at the next exam. No email/cron pipeline exists on this
+// project (would need SMTP credentials + a scheduled job service) so this is served on-demand
+// whenever the Admin page is opened; the frontend adds a "copy as text" button so it can be
+// pasted into WhatsApp/email by hand if the teacher wants to send it somewhere.
+app.get('/api/admin/weekly-digest', requireAuth, requireAdmin, async (req, res) => {
+  if (!pool) return res.status(500).json({ error: 'No database connected on the server yet.' });
+  try {
+    const [weekOverall, strugglingStudents, studentMistakes, gradeMistakes] = await Promise.all([
+      // Demo/test accounts are excluded everywhere below — see /api/admin/users/:id/demo.
+      pool.query(`
+        SELECT COUNT(DISTINCT a.user_id) AS active_students, COUNT(*) AS attempts_7d,
+          ROUND(AVG(CASE WHEN a.correct THEN 100 ELSE 0 END)::numeric, 1) AS overall_correct_pct_7d
+        FROM attempts a JOIN users u ON u.id = a.user_id
+        WHERE a.created_at >= NOW() - INTERVAL '7 days' AND a.correct IS NOT NULL AND COALESCE(u.is_demo, false) = false
+      `),
+      // Students with at least 3 graded attempts this week, worst correctness rate first —
+      // the "check in on these students" list.
+      pool.query(`
+        SELECT u.id, u.name, u.grade, COUNT(*) AS attempts_7d,
+          ROUND(AVG(CASE WHEN a.correct THEN 100 ELSE 0 END)::numeric, 1) AS correct_pct_7d
+        FROM attempts a JOIN users u ON u.id = a.user_id
+        WHERE a.created_at >= NOW() - INTERVAL '7 days' AND a.correct IS NOT NULL AND COALESCE(u.is_demo, false) = false
+        GROUP BY u.id, u.name, u.grade
+        HAVING COUNT(*) >= 3
+        ORDER BY correct_pct_7d ASC
+        LIMIT 15
+      `),
+      // Each struggling student's single most common mistake tag this week (rows arrive
+      // ordered by count per user, descending — the JS below keeps only the first per user).
+      // No demo filter needed here — this is only ever looked up by the ids already returned
+      // in the (already-filtered) strugglingStudents query above.
+      pool.query(`
+        SELECT a.user_id, a.mistake_tag, COUNT(*) AS cnt
+        FROM attempts a
+        WHERE a.created_at >= NOW() - INTERVAL '7 days' AND a.correct = false AND a.mistake_tag IS NOT NULL
+        GROUP BY a.user_id, a.mistake_tag
+        ORDER BY a.user_id, cnt DESC
+      `),
+      pool.query(`
+        SELECT t.grade, a.mistake_tag, COUNT(*) AS cnt
+        FROM attempts a JOIN topics t ON t.id = a.topic_id JOIN users u ON u.id = a.user_id
+        WHERE a.created_at >= NOW() - INTERVAL '7 days' AND a.correct = false AND a.mistake_tag IS NOT NULL AND COALESCE(u.is_demo, false) = false
+        GROUP BY t.grade, a.mistake_tag
+        ORDER BY t.grade, cnt DESC
+      `),
+    ]);
+
+    const topMistakeByUser = {};
+    studentMistakes.rows.forEach(r => {
+      if (!topMistakeByUser[r.user_id]) topMistakeByUser[r.user_id] = shortTagLabel(r.mistake_tag);
+    });
+
+    const mistakesByGradeThisWeek = {};
+    gradeMistakes.rows.forEach(r => {
+      const grade = r.grade;
+      mistakesByGradeThisWeek[grade] = mistakesByGradeThisWeek[grade] || [];
+      if (mistakesByGradeThisWeek[grade].length < 5) {
+        mistakesByGradeThisWeek[grade].push({ tag: shortTagLabel(r.mistake_tag), count: Number(r.cnt) });
+      }
+    });
+
+    const overallRow = weekOverall.rows[0] || {};
+    res.json({
+      weekOverall: {
+        activeStudents: Number(overallRow.active_students) || 0,
+        attempts7d: Number(overallRow.attempts_7d) || 0,
+        overallCorrectPct7d: overallRow.overall_correct_pct_7d !== null && overallRow.overall_correct_pct_7d !== undefined ? Number(overallRow.overall_correct_pct_7d) : null,
+      },
+      strugglingStudents: strugglingStudents.rows.map(r => ({
+        name: r.name,
+        grade: r.grade,
+        attempts7d: Number(r.attempts_7d),
+        correctPct7d: Number(r.correct_pct_7d),
+        topMistake: topMistakeByUser[r.id] || null,
+      })),
+      mistakesByGradeThisWeek,
+    });
+  } catch (err) {
+    console.error('Admin weekly digest fetch error:', err);
+    res.status(500).json({ error: 'Could not load the weekly digest.' });
   }
 });
 
@@ -961,12 +1076,23 @@ function withLanguage(prompt, lang){
   return prompt;
 }
 
-const SYSTEM_PROMPT = `You are a physics tutor for Lebanese high school students (Lebanese national curriculum, grades 9-12 / Brevet-Bac).
-When given a physics problem (as text, or shown in a photo):
-1. Identify the relevant law/formula.
-2. Solve step by step, showing each calculation.
-3. If the student's own attempt is included and contains a mistake, point out exactly where the mistake is and correct it.
-Keep it clear, concise, and appropriate for a high school student. Use simple language.`;
+// This tool is used for homework help, so the #1 rule is: NEVER hand the student the finished
+// answer in one shot. The response is a ladder of steps — a short "hint" for each step (a
+// guiding question, no numbers/results) that the student sees first, and a "detail" (the full
+// worked reasoning + calculation for that step) that is only revealed when the student asks
+// for it, one step at a time. Only the LAST step's detail states the final answer.
+const SYSTEM_PROMPT = `You are a physics tutor for Lebanese high school students (Lebanese national curriculum, grades 9-12 / Brevet-Bac), used as a HOMEWORK HELP tool. Your most important rule: never give the finished answer immediately. Students must work through guided steps themselves, not be handed a completed solution to copy.
+
+When given a physics problem (as text, or shown in a photo), break the solution into a sequence of steps (usually 3-6 — as many as the problem genuinely needs, no more). Each step is an object with:
+- "hint": a short guiding question or nudge for THIS step only (e.g. "What law relates pressure and depth here?" / "What two forces are acting on the object?"). It must contain NO numbers, results, or the answer to this step — it should make the student think, not tell them what to write.
+- "detail": the full worked explanation for THIS step only — the reasoning, the relevant formula, and the calculation — revealed only after the student asks to see it. The "detail" of the LAST step must clearly state the final answer, with correct units.
+
+If a photo of the student's OWN attempt is included alongside the problem, also include a top-level "feedback" string: briefly and gently note whether their attempt was on the right track and, if not, which step number they went wrong at — do not restate the full solution inside it, just point them back toward the right step. If no student attempt was included, set "feedback" to null.
+
+Keep language clear, concise, and appropriate for a high school student.
+
+Respond with ONLY a single JSON object, nothing else — no markdown fences, no preamble, no text outside the JSON. Format:
+{"steps": [{"hint": "...", "detail": "..."}, {"hint": "...", "detail": "..."}], "feedback": null}`;
 
 // --- Solver topic classification ---
 // The solver UI doesn't ask the student which topic/grade a problem is (that would add
@@ -1007,6 +1133,51 @@ app.get('/', (req, res) => {
   res.send('Physics tutor backend is running.');
 });
 
+// Some students are weaker in English than in the subject itself, and can get stuck on a
+// question purely on VOCABULARY, not physics. This does NOT translate the whole question and
+// does NOT solve anything — it picks out just the handful of English words/phrases in a
+// question that a weak-English student might not know and explains them briefly in Arabic, so
+// they understand what's being ASKED. Used as an optional per-question button in Question
+// Bank / Practice Exam — never shown automatically, never affects grading or scoring.
+const KEY_TERMS_HELPER_SYSTEM_PROMPT = `You help Lebanese physics students who are weaker in English understand a physics question written in English. You are NOT translating the whole question and NOT solving it — you are only explaining the handful of English words/phrases in the question that a weak-English (but not weak-physics) student might not recognize, so they understand what is being asked.
+
+Rules:
+- Pick only the important physics/technical/instructional words or short phrases (e.g. "terminal velocity", "at rest", "coefficient of friction", "increases", "in the opposite direction", "negligible") — usually 2-6 items. Do not list ordinary simple words.
+- For each item, give the exact English word/phrase as it appears in the question, and a short Arabic (Lebanese colloquial is fine) explanation of what it means — a few words, not a full sentence essay.
+- NEVER translate or reveal any numbers, the physics answer, or solve any part of the question. Do not explain the physics concept's solution — only the vocabulary/meaning.
+- If the question has no real vocabulary barrier for a physics student, return an empty array — don't force it.
+
+Respond with ONLY a single JSON array, nothing else — no markdown, no preamble. Format:
+[{"term": "terminal velocity", "meaning": "السرعة النهائية يلي بيوصلها الجسم وما بتزيد بعدها"}]`;
+
+app.post('/api/explain-terms', aiLimiter, async (req, res) => {
+  const { text } = req.body;
+  if (!text || typeof text !== 'string' || !text.trim()) {
+    return res.status(400).json({ error: 'Please provide the question text.' });
+  }
+  if (!process.env.GROQ_API_KEY) {
+    return res.status(500).json({ error: 'Server is missing its API key. Set GROQ_API_KEY in the environment.' });
+  }
+  try {
+    const raw = await callGroq(KEY_TERMS_HELPER_SYSTEM_PROMPT, `Question: ${text.trim()}`, 300);
+    let terms;
+    try {
+      terms = extractJson(raw);
+    } catch (e) {
+      console.error('Failed to parse key-terms JSON:', raw);
+      return res.status(502).json({ error: 'Could not get an explanation right now. Try again.' });
+    }
+    if (!Array.isArray(terms)) terms = [];
+    res.json({ terms });
+  } catch (err) {
+    if (err.message === 'groq_error') {
+      return res.status(502).json({ error: 'The AI service returned an error. Check the server logs.' });
+    }
+    console.error('Explain-terms error:', err);
+    res.status(500).json({ error: 'Something went wrong on the server.' });
+  }
+});
+
 app.post('/api/solve', aiLimiter, async (req, res) => {
   // `grade` is optional and not sent by the UI today — if present (future UI change) it
   // narrows classification to that grade's topic list; if absent, classification searches
@@ -1022,18 +1193,41 @@ app.post('/api/solve', aiLimiter, async (req, res) => {
   }
 
   try {
-    const solution = await callGemini(withLanguage(SYSTEM_PROMPT, lang), problem, image);
+    const raw = await callGemini(withLanguage(SYSTEM_PROMPT, lang), problem, image);
+
+    let parsed;
+    try {
+      const match = raw.match(/\{[\s\S]*\}/);
+      parsed = JSON.parse(match ? match[0] : raw);
+    } catch (e) {
+      console.error('Failed to parse solver steps JSON:', raw);
+      return res.status(502).json({ error: 'Could not generate a valid solution. Try again.' });
+    }
+    const steps = Array.isArray(parsed.steps)
+      ? parsed.steps.filter(s => s && typeof s.hint === 'string' && typeof s.detail === 'string')
+      : [];
+    if (!steps.length) {
+      console.error('Solver returned no usable steps:', raw);
+      return res.status(502).json({ error: 'Could not generate a valid solution. Try again.' });
+    }
+    const feedback = typeof parsed.feedback === 'string' && parsed.feedback.trim() ? parsed.feedback.trim() : null;
+
+    // Flatten to plain text for storage/classification. solver_history's `solution` column is
+    // never displayed back in a list (/api/my/history only selects id, problem, created_at),
+    // so restructuring what lives in it here is safe.
+    const flatSolution = steps.map((s, i) => `Step ${i + 1}: ${s.hint}\n${s.detail}`).join('\n\n')
+      + (feedback ? `\n\nFeedback on your attempt: ${feedback}` : '');
 
     if (pool && req.user) {
       pool.query(
         'INSERT INTO solver_history (user_id, problem, solution) VALUES ($1, $2, $3)',
-        [req.user.userId, problem || '(photo)', solution]
+        [req.user.userId, problem || '(photo)', flatSolution]
       ).catch(err => console.error('Failed to save solver history:', err));
 
       // Unified data model: log this as an ungraded attempt (source='solver'). `correct` is
       // left null — the solver isn't testing the student, it's solving for them, so
       // correctness doesn't apply unless/until the UI asks for the student's own attempt too.
-      classifySolverTopic(problem, solution, grade).then(match => {
+      classifySolverTopic(problem, flatSolution, grade).then(match => {
         if (!match) return;
         resolveTopicId(match.grade, match.topic).then(topicId => {
           if (!topicId) return;
@@ -1045,7 +1239,7 @@ app.post('/api/solve', aiLimiter, async (req, res) => {
       });
     }
 
-    res.json({ solution: solution || 'No solution returned.' });
+    res.json({ steps, feedback });
   } catch (err) {
     if (err.message === 'gemini_error') {
       return res.status(502).json({ error: 'The AI service returned an error. Check the server logs.' });
@@ -1102,7 +1296,7 @@ app.post('/api/study-plan', aiLimiter, async (req, res) => {
     }
   }
 
-  const userMessage = `Grade/branch: ${grade}
+  const userMessage = `Grade/branch: ${GRADE_LABELS[grade] || grade}
 Exam date: ${examDate}
 Days left until the exam: ${daysLeft}
 Physics lessons/topics still to cover:
@@ -1360,6 +1554,14 @@ The array must have exactly the requested number of objects.`;
 
 const QUESTION_BANK_DIFFICULTIES = ['easy', 'medium', 'hard', 'examstyle', 'pastpaper'];
 
+// One short guiding hint for a student who's stuck on a practice question and hasn't
+// answered yet — same "never give the answer away" philosophy as the Solver, applied here so
+// a stuck student has somewhere to go besides leaving it blank or guessing.
+const QUESTION_BANK_HINT_SYSTEM_PROMPT = `You are a physics teacher giving ONE short hint to a Lebanese high school student who is stuck on a practice question and has NOT answered it yet. You will be given the topic and the question text.
+Give ONE short guiding hint (1-2 sentences) — remind them which law/formula/concept applies here, or what to look at or consider first.
+Do NOT give the final answer, any numeric result, or the full solution. Do not solve any part of the problem for them.
+Respond with ONLY the hint text, nothing else — no JSON, no markdown, no preamble.`;
+
 app.post('/api/question-bank/generate', aiLimiter, async (req, res) => {
   const { grade, topic, difficulty, count, lang } = req.body;
   if (!grade || !CURRICULUM[grade]) return res.status(400).json({ error: 'Please provide a valid grade.' });
@@ -1388,6 +1590,27 @@ app.post('/api/question-bank/generate', aiLimiter, async (req, res) => {
       return res.status(502).json({ error: 'The AI service returned an error. Check the server logs.' });
     }
     console.error('Question bank generate error:', err);
+    res.status(500).json({ error: 'Something went wrong on the server.' });
+  }
+});
+
+app.post('/api/question-bank/hint', aiLimiter, async (req, res) => {
+  const { grade, topic, question, lang } = req.body;
+  if (!question || typeof question !== 'string' || !question.trim()) {
+    return res.status(400).json({ error: 'Please provide the question text.' });
+  }
+  if (!process.env.GROQ_API_KEY) {
+    return res.status(500).json({ error: 'Server is missing its API key. Set GROQ_API_KEY in the environment.' });
+  }
+  try {
+    const userMessage = `Grade/branch: ${GRADE_LABELS[grade] || grade || 'Unknown'}\nTopic: ${topic || 'Unknown'}\nQuestion: ${question}`;
+    const hint = await callGroq(withLanguage(QUESTION_BANK_HINT_SYSTEM_PROMPT, lang), userMessage, 120);
+    res.json({ hint: (hint || '').trim() || 'Think about which law or formula applies here.' });
+  } catch (err) {
+    if (err.message === 'groq_error') {
+      return res.status(502).json({ error: 'The AI service returned an error. Check the server logs.' });
+    }
+    console.error('Question bank hint error:', err);
     res.status(500).json({ error: 'Something went wrong on the server.' });
   }
 });
@@ -1738,7 +1961,8 @@ app.get('/api/teacher/class/:grade', requireAuth, requireAdmin, async (req, res)
   try {
     const overall = await pool.query(
       `SELECT COUNT(*) AS total_attempts, SUM(CASE WHEN a.correct THEN 1 ELSE 0 END) AS total_correct
-       FROM attempts a JOIN topics t ON t.id = a.topic_id WHERE t.grade = $1`,
+       FROM attempts a JOIN topics t ON t.id = a.topic_id JOIN users u ON u.id = a.user_id
+       WHERE t.grade = $1 AND COALESCE(u.is_demo, false) = false`,
       [grade]
     );
     const totalAttempts = Number(overall.rows[0].total_attempts) || 0;
@@ -1748,13 +1972,15 @@ app.get('/api/teacher/class/:grade', requireAuth, requireAdmin, async (req, res)
     // Start from ALL topics defined for this grade (not just ones with attempts) so
     // topics nobody has practiced yet still show up in the dashboard — a teacher
     // needs to see "0 attempts, nothing here yet" just as much as low-mastery topics.
+    // Demo/test accounts (see /api/admin/users/:id/demo) are excluded here too.
     const topics = await pool.query(
       `WITH grade_topics AS (
          SELECT id AS topic_id, title AS topic_title FROM topics WHERE grade = $1
        ),
        topic_attempts AS (
          SELECT a.user_id, a.correct, a.mistake_tag, a.question_text, gt.topic_id
-         FROM attempts a JOIN grade_topics gt ON gt.topic_id = a.topic_id
+         FROM attempts a JOIN grade_topics gt ON gt.topic_id = a.topic_id JOIN users u ON u.id = a.user_id
+         WHERE COALESCE(u.is_demo, false) = false
        ),
        per_student_topic AS (
          SELECT topic_id, user_id, COUNT(*) AS attempts,
@@ -1889,29 +2115,33 @@ app.get('/api/teacher/topic/:grade/:topicId', requireAuth, requireAdmin, async (
     const topic = await pool.query('SELECT id, title, grade FROM topics WHERE id = $1 AND grade = $2', [topicId, grade]);
     if (!topic.rows.length) return res.status(404).json({ error: 'Topic not found for this grade.' });
 
+    // Demo/test accounts (see /api/admin/users/:id/demo) are excluded from all four queries
+    // below — a demo account's clicking around shouldn't show up as a "student" here at all.
     const students = await pool.query(
       `SELECT u.id, u.name, u.email,
               COUNT(*) AS attempts,
               SUM(CASE WHEN a.correct THEN 1 ELSE 0 END) AS correct_count,
               CASE WHEN COUNT(*) >= 3 THEN ROUND(100.0 * SUM(CASE WHEN a.correct THEN 1 ELSE 0 END) / COUNT(*), 1) ELSE NULL END AS mastery_pct
        FROM attempts a JOIN users u ON u.id = a.user_id
-       WHERE a.topic_id = $1
+       WHERE a.topic_id = $1 AND COALESCE(u.is_demo, false) = false
        GROUP BY u.id, u.name, u.email
        ORDER BY mastery_pct ASC NULLS LAST, u.name`,
       [topicId]
     );
 
     const mistakes = await pool.query(
-      `SELECT mistake_tag, COUNT(*) AS cnt, COUNT(DISTINCT user_id) AS student_cnt FROM attempts
-       WHERE topic_id = $1 AND correct = false AND mistake_tag IS NOT NULL
-       GROUP BY mistake_tag ORDER BY cnt DESC, mistake_tag`,
+      `SELECT a.mistake_tag, COUNT(*) AS cnt, COUNT(DISTINCT a.user_id) AS student_cnt
+       FROM attempts a JOIN users u ON u.id = a.user_id
+       WHERE a.topic_id = $1 AND a.correct = false AND a.mistake_tag IS NOT NULL AND COALESCE(u.is_demo, false) = false
+       GROUP BY a.mistake_tag ORDER BY cnt DESC, a.mistake_tag`,
       [topicId]
     );
 
     const missedQuestions = await pool.query(
-      `SELECT question_text, COUNT(*) AS cnt FROM attempts
-       WHERE topic_id = $1 AND correct = false
-       GROUP BY question_text ORDER BY cnt DESC, question_text LIMIT 3`,
+      `SELECT a.question_text, COUNT(*) AS cnt
+       FROM attempts a JOIN users u ON u.id = a.user_id
+       WHERE a.topic_id = $1 AND a.correct = false AND COALESCE(u.is_demo, false) = false
+       GROUP BY a.question_text ORDER BY cnt DESC, a.question_text LIMIT 3`,
       [topicId]
     );
 
@@ -1919,10 +2149,11 @@ app.get('/api/teacher/topic/:grade/:topicId', requireAuth, requireAdmin, async (
     // can see e.g. 42% -> 61% -> 78% across the days they've been teaching/practicing it.
     // Only days with attempts appear (no padding for silent days) to keep it readable.
     const trend = await pool.query(
-      `SELECT date_trunc('day', created_at) AS day,
+      `SELECT date_trunc('day', a.created_at) AS day,
               COUNT(*) AS attempts,
-              SUM(CASE WHEN correct THEN 1 ELSE 0 END) AS correct_count
-       FROM attempts WHERE topic_id = $1
+              SUM(CASE WHEN a.correct THEN 1 ELSE 0 END) AS correct_count
+       FROM attempts a JOIN users u ON u.id = a.user_id
+       WHERE a.topic_id = $1 AND COALESCE(u.is_demo, false) = false
        GROUP BY day ORDER BY day`,
       [topicId]
     );
@@ -2029,10 +2260,13 @@ app.post('/api/teacher/recommend', requireAuth, requireAdmin, aiLimiter, async (
   }
 
   try {
+    // Demo/test accounts (see /api/admin/users/:id/demo) are excluded here — a demo account's
+    // clicking around should never nudge what the AI recommends teaching next.
     const topics = await pool.query(
       `WITH topic_attempts AS (
          SELECT a.*, t.title AS topic_title, t.order_index
-         FROM attempts a JOIN topics t ON t.id = a.topic_id WHERE t.grade = $1
+         FROM attempts a JOIN topics t ON t.id = a.topic_id JOIN users u ON u.id = a.user_id
+         WHERE t.grade = $1 AND COALESCE(u.is_demo, false) = false
        ),
        per_student_topic AS (
          SELECT topic_title, order_index, user_id, COUNT(*) AS attempts,
