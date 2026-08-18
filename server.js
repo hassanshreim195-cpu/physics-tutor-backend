@@ -30,10 +30,13 @@ const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
 
 app.use(cors({
   origin(origin, callback) {
-    // Allow requests with no Origin header at all (server-to-server calls,
-    // curl, mobile webviews) — only browser-sent cross-origin requests carry
-    // an Origin header we need to check.
-    if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+    // Allow requests with no Origin header at all (server-to-server calls, curl, mobile
+    // webviews), and the literal string "null" — browsers send that for local file:// pages
+    // (e.g. double-clicking an .html file straight from disk, which is how test/diagnostic
+    // pages get opened while debugging) and some sandboxed contexts. Neither of those is a
+    // browser-enforced cross-origin request in the way a real website's Origin header is, so
+    // there's no CORS protection being weakened by allowing them.
+    if (!origin || origin === 'null' || ALLOWED_ORIGINS.includes(origin)) {
       callback(null, true);
     } else {
       callback(new Error('Not allowed by CORS'));
