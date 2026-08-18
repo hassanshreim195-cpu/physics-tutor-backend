@@ -5,6 +5,20 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 require('dotenv').config();
 const { CURRICULUM, tagsForTopic } = require('./topics');
+const { GRADE_STYLE_GUIDE } = require('./curriculum_style');
+
+// Builds the "match real Lebanese exams" grounding block injected into Question Bank / Exam
+// generation prompts for a given grade — see curriculum_style.js for where this came from and
+// why type mix varies by grade (Grade 12 real exams never use tf/mcq, for example).
+function styleGroundingFor(grade){
+  const g = GRADE_STYLE_GUIDE[grade];
+  if (!g) return '';
+  return `Real Lebanese exam grounding for ${g.label} (match this, not a generic international textbook style):
+- Actual topic scope/order at this grade: ${g.scope}
+- Question types that actually appear in real ${g.label} physics exams: ${g.types.join(', ')}. Do not use any other type for this grade.
+- Real format/phrasing conventions: ${g.conventions}
+- Example of the real style (for calibration only — write NEW questions, never reuse this example): ${g.example}`;
+}
 
 const app = express();
 
@@ -1160,14 +1174,17 @@ app.post('/api/explain-terms', aiLimiter, async (req, res) => {
   }
   try {
     const raw = await callGroq(KEY_TERMS_HELPER_SYSTEM_PROMPT, `Question: ${text.trim()}`, 300);
-    let terms;
+    let terms = [];
     try {
-      terms = extractJson(raw);
+      const parsed = extractJson(raw);
+      if (Array.isArray(parsed)) terms = parsed;
     } catch (e) {
-      console.error('Failed to parse key-terms JSON:', raw);
-      return res.status(502).json({ error: 'Could not get an explanation right now. Try again.' });
+      // Non-fatal: the model sometimes answers "no hard vocabulary here" in plain text
+      // instead of returning `[]` when a question has no real vocabulary barrier. Treat any
+      // unparseable response as "no terms" rather than showing the student an error for what
+      // is, functionally, a harmless empty result.
+      console.warn('Key-terms response was not valid JSON, defaulting to empty list:', raw);
     }
-    if (!Array.isArray(terms)) terms = [];
     res.json({ terms });
   } catch (err) {
     if (err.message === 'groq_error') {
@@ -1353,6 +1370,7 @@ const GRADE_LABELS = {
 };
 
 const EXAM_GEN_SYSTEM_PROMPT = `You are a physics exam writer for a Lebanese high school student, writing a FULL-LENGTH practice exam in the style of an official Lebanese Baccalaureate/Brevet physics exam — not a set of short isolated questions.
+You will also be given a "Real Lebanese exam grounding" block for the exact grade — follow its phrasing/format conventions closely (command verbs like "Determine/Deduce/Justify/Show that", given-value conventions like g=10 N/kg or 10 m/s² stated explicitly, named local characters, realistic non-round numeric values) so the exam reads like a real Lebanese paper, not a generic international-textbook one.
 Given a grade/branch, a specific list of lesson/chapter names the student chose to be tested on, and how many big problems to write, write exactly that many comprehensive multi-part problems, ordered from easiest to hardest overall.
 Each problem should:
 - Present a realistic physical scenario/setup (1-3 sentences — concrete numbers, objects, a situation), then walk the student through it via several lettered sub-questions ("parts"), the way real exam problems are structured (e.g. a) find X, b) use your answer to (a) to find Y, c) explain/interpret the result...).
@@ -1363,8 +1381,8 @@ Respond with ONLY a JSON array, nothing else — no markdown, no preamble. Each 
 - "difficulty": one of "easy", "medium", "hard"
 - "scenario": the shared context/setup text for this problem
 - "parts": an array of objects, each with "label" (a single letter — "a", "b", "c", ...) and "question" (that part's question text)
-Example:
-[{"topic":"Motion of a Particle in a Plane","difficulty":"easy","scenario":"A ball is launched from ground level at 20 m/s at 30° above the horizontal (g = 9.8 m/s²).","parts":[{"label":"a","question":"Find the time it takes the ball to reach its maximum height."},{"label":"b","question":"Find the maximum height reached."},{"label":"c","question":"Find the total horizontal range."}]}]`;
+Example (note g=10 m/s², the Lebanese convention — not 9.8):
+[{"topic":"Motion of a Particle in a Plane","difficulty":"easy","scenario":"A ball is launched from ground level at 20 m/s at 30° above the horizontal (g = 10 m/s²).","parts":[{"label":"a","question":"Determine the time it takes the ball to reach its maximum height."},{"label":"b","question":"Deduce the maximum height reached."},{"label":"c","question":"Determine the total horizontal range."}]}]`;
 
 // Used by /api/question-bank/grade (unchanged format there: a list of small tf/mcq/problem
 // questions, graded together in one text-only Groq call). Practice Exam grading now uses its
@@ -1408,7 +1426,8 @@ app.post('/api/generate-exam', aiLimiter, async (req, res) => {
   const chosenLessons = Array.isArray(lessons) && lessons.length ? lessons : CURRICULUM[grade];
   const lessonList = chosenLessons && chosenLessons.length ? chosenLessons.join(', ') : 'general physics topics for this grade';
   const problemCount = examProblemCountFor(grade);
-  const userMessage = `Grade/branch: ${GRADE_LABELS[grade] || grade}\nLessons to draw problems from (use these EXACT names for "topic"): ${lessonList}\nNumber of big problems to write: ${problemCount}`;
+  const grounding = styleGroundingFor(grade);
+  const userMessage = `Grade/branch: ${GRADE_LABELS[grade] || grade}\nLessons to draw problems from (use these EXACT names for "topic"): ${lessonList}\nNumber of big problems to write: ${problemCount}${grounding ? `\n\n${grounding}` : ''}`;
 
   try {
     const text = await callGroq(withLanguage(EXAM_GEN_SYSTEM_PROMPT, lang), userMessage, Math.min(3500, 500 + problemCount * 550));
@@ -1537,17 +1556,16 @@ app.post('/api/grade-exam', aiLimiter, async (req, res) => {
 // separate from source='exam' so the Dashboard's "exam average" stat keeps meaning full
 // practice exams only) but still feed the same unified mastery/mistake data everywhere else.
 const QUESTION_BANK_GEN_SYSTEM_PROMPT = `You are a physics question writer for a Lebanese high school student practicing ONE specific topic in a focused, repeatable set (not a full multi-topic exam).
-You will be given: grade/branch, ONE topic name, a difficulty/style, and how many questions to write.
-Write EXACTLY that many questions, ALL about the given topic only.
+You will be given: grade/branch, ONE topic name, a difficulty/style, how many questions to write, and a "Real Lebanese exam grounding" block for this exact grade — READ IT CAREFULLY and follow it closely. Real Lebanese exams have a distinct house style (specific command verbs, True/False items that require correcting the false statement, explicit given-value conventions like g=10 N/kg, and — critically — different grades use different question TYPES in real exams, e.g. Grade 12 never uses true/false or multiple-choice at all). Writing generic international-textbook-style questions instead of matching this grounding is exactly the mistake to avoid.
+Write EXACTLY that many questions, ALL about the given topic only, using ONLY the question types listed as real for this grade in the grounding block.
 Difficulty/style meanings:
 - "easy": simple recall or single-step questions.
 - "medium": typical homework-level questions, may need two steps.
 - "hard": multi-step or conceptually tricky questions.
 - "examstyle": formal, rigorous exam-style questions on this one topic, similar to how it would be tested in an official Lebanese exam.
 - "pastpaper": written in the phrasing/structure typical of official Lebanese Baccalaureate/Brevet past exam papers for this topic — write entirely NEW questions in that style, never claim to reproduce or recall a real past question.
-Use a mix of question types across the set: true/false, multiple-choice, and problem/calculation questions.
 Respond with ONLY a JSON array, nothing else — no markdown, no preamble. Each object must have:
-- "type": one of "tf", "mcq", "problem"
+- "type": one of "tf", "mcq", "problem" (only types present in the grounding block's allowed list for this grade)
 - "question": the question text
 - "choices": an array of 3-4 answer options (ONLY for "mcq"; omit for "tf" and "problem")
 The array must have exactly the requested number of objects.`;
@@ -1572,13 +1590,22 @@ app.post('/api/question-bank/generate', aiLimiter, async (req, res) => {
   const n = Math.min(15, Math.max(3, Number(count) || 10));
 
   try {
-    const userMessage = `Grade/branch: ${grade}\nTopic: ${topic}\nDifficulty/style: ${diff}\nNumber of questions: ${n}`;
+    const grounding = styleGroundingFor(grade);
+    const userMessage = `Grade/branch: ${GRADE_LABELS[grade] || grade}\nTopic: ${topic}\nDifficulty/style: ${diff}\nNumber of questions: ${n}${grounding ? `\n\n${grounding}` : ''}`;
     const text = await callGroq(withLanguage(QUESTION_BANK_GEN_SYSTEM_PROMPT, lang), userMessage, Math.min(1500, 200 + n * 120));
     let questions;
     try {
       questions = extractJson(text);
     } catch (e) {
       console.error('Failed to parse question bank JSON:', text);
+      return res.status(502).json({ error: 'Could not generate practice questions. Try again.' });
+    }
+    // Defensive filter: keep only the types real exams actually use at this grade, in case the
+    // model drifts (e.g. slips in an MCQ for Grade 12, which never uses one in practice).
+    const allowedTypes = (GRADE_STYLE_GUIDE[grade] && GRADE_STYLE_GUIDE[grade].types) || ['tf', 'mcq', 'problem'];
+    questions = questions.filter(q => q && allowedTypes.includes(q.type || 'problem'));
+    if (!questions.length) {
+      console.error('All generated questions were filtered out for grade', grade, '- raw:', text);
       return res.status(502).json({ error: 'Could not generate practice questions. Try again.' });
     }
     // Stamp topic (and difficulty, as a fallback) on every question so grading/mistake-tagging
