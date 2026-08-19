@@ -4,7 +4,8 @@
   "description": "Backend that connects Hasan's physics tutoring site to Claude for the AI Solver feature.",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test"
   },
   "engines": {
     "node": ">=18"
