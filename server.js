@@ -3,9 +3,32 @@ const cors = require('cors');
 const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 require('dotenv').config();
 const { CURRICULUM, tagsForTopic } = require('./topics');
 const { GRADE_STYLE_GUIDE } = require('./curriculum_style');
+
+// --- Fail fast on missing/unsafe configuration ---
+// These used to fall back to defaults, which meant a typo'd or forgotten environment variable
+// on Render produced a site that *looked* like it was working while being wide open: the JWT
+// fallback secret is published in this source file, so anyone who read it could mint a token
+// for any account. Crashing at boot is much safer than serving a compromised app — Render
+// shows the failed deploy and keeps the previous working version running.
+const REQUIRED_ENV = ['JWT_SECRET', 'DATABASE_URL'];
+const missingEnv = REQUIRED_ENV.filter(k => !process.env[k]);
+if (missingEnv.length) {
+  console.error(`FATAL: missing required environment variable(s): ${missingEnv.join(', ')}.`);
+  console.error('Set them in the Render dashboard (Environment tab) and redeploy.');
+  process.exit(1);
+}
+if (process.env.JWT_SECRET.length < 32) {
+  console.error('FATAL: JWT_SECRET is too short — use at least 32 random characters.');
+  console.error('Generate one with:  node -e "console.log(require(\'crypto\').randomBytes(48).toString(\'hex\'))"');
+  process.exit(1);
+}
+if (!process.env.ADMIN_EMAIL) {
+  console.warn('WARNING: ADMIN_EMAIL is not set — no account will be promoted to teacher/admin automatically.');
+}
 
 // Builds the "match real Lebanese exams" grounding block injected into Question Bank / Exam
 // generation prompts for a given grade — see curriculum_style.js for where this came from and
@@ -57,9 +80,17 @@ app.use(cors({
     }
   }
 }));
-// Raised from 10mb: Practice Exam now sends one photo per "big problem" (up to 5 problems
-// in one grading request), so a single submission can carry several MB of images at once.
-app.use(express.json({ limit: '25mb' }));
+// Body size limits, scoped by route.
+//
+// Only two endpoints legitimately receive photos: Practice Exam grading (one photo per "big
+// problem", up to 5 in a single submission) and the Solver (one photo of a problem). Those get
+// a large ceiling. Everything else — login, register, bookings, admin actions — is small JSON,
+// and applying a 25mb limit globally meant an attacker could tie up memory by POSTing 25mb to
+// the login endpoint. Route-specific parsers run before the small global one below.
+const largeJson = express.json({ limit: '25mb' });
+app.use('/api/grade-exam', largeJson);
+app.use('/api/solve', largeJson);
+app.use(express.json({ limit: '200kb' }));
 
 // --- Simple in-memory rate limiting (no external dependency needed) ---
 // Keyed by IP address. Each limiter instance keeps its own bucket map and
@@ -67,8 +98,8 @@ app.use(express.json({ limit: '25mb' }));
 // This is process-local (fine for a single free-tier Render instance) —
 // if the app is ever scaled to multiple instances, swap this for a
 // shared store (e.g. Redis) instead.
-function makeRateLimiter({ windowMs, max, message }) {
-  const hits = new Map(); // ip -> { count, resetAt }
+function makeRateLimiter({ windowMs, max, message, keyBy }) {
+  const hits = new Map(); // key -> { count, resetAt }
   const sweeper = setInterval(() => {
     const now = Date.now();
     for (const [key, entry] of hits) {
@@ -78,7 +109,7 @@ function makeRateLimiter({ windowMs, max, message }) {
   sweeper.unref();
 
   return (req, res, next) => {
-    const key = req.ip || 'unknown';
+    const key = (keyBy && keyBy(req)) || req.ip || 'unknown';
     const now = Date.now();
     let entry = hits.get(key);
     if (!entry || now > entry.resetAt) {
@@ -105,22 +136,88 @@ app.use('/api/', generalLimiter);
 // free-tier API quotas shared across every visitor, so a handful of accidental
 // or abusive rapid-fire requests from one device can exhaust the daily quota
 // for everyone else using the site.
+//
+// Keyed by ACCOUNT, not IP. A whole class sitting in one room shares a single public IP through
+// the school's router, so an IP-keyed limit of 8/minute would be spent by the first two or
+// three students and lock out everyone else — the exact situation this site is built for.
+// requireAuth runs before this in the aiGuard chain, so req.user is always available here;
+// the IP fallback only applies if that ever changes.
 const aiLimiter = makeRateLimiter({
-  windowMs: 60 * 1000, max: 8,
-  message: 'Too many AI requests from this device — please wait a minute before trying again.'
+  windowMs: 60 * 1000, max: 12,
+  message: 'You are sending requests very quickly — please wait a minute before trying again.',
+  keyBy: (req) => (req.user && req.user.userId ? 'u' + req.user.userId : null),
 });
 
 // Slow down brute-force login/registration attempts.
 const authLimiter = makeRateLimiter({
-  windowMs: 15 * 60 * 1000, max: 20,
+  windowMs: 15 * 60 * 1000, max: 10,
   message: 'Too many attempts — please wait a few minutes before trying again.'
 });
+
+// --- Per-student daily AI budget ---
+// The per-IP limiter above stops rapid-fire bursts, but not a single account working steadily
+// through the day, and it can be sidestepped by changing network. Groq/Gemini run on shared
+// free-tier quotas, so one heavy user can exhaust the day's allowance for the whole class.
+// This caps how many AI calls one *account* can make per day. The limit is deliberately
+// generous — a student doing a full exam plus a long solver session lands nowhere near it —
+// so in practice it only ever trips on automated abuse.
+//
+// Held in memory, so it resets if Render restarts the instance. That's an accepted trade-off:
+// the real protection is that these routes now require a login at all, and the teacher can see
+// and remove accounts from the admin panel. A restart-proof version would need a Redis or a
+// counter table, which isn't worth the write-per-request at this scale.
+const AI_DAILY_LIMIT = Number(process.env.AI_DAILY_LIMIT || 120);
+const aiUsage = new Map(); // `${userId}:${YYYY-MM-DD}` -> count
+
+setInterval(() => {
+  // Drop counters for any day other than today; the key encodes the date.
+  const today = new Date().toISOString().slice(0, 10);
+  for (const key of aiUsage.keys()) {
+    if (!key.endsWith(today)) aiUsage.delete(key);
+  }
+}, 60 * 60 * 1000).unref();
+
+function aiQuota(req, res, next){
+  if (!req.user) return next(); // requireAuth runs first and will already have rejected this
+  const key = `${req.user.userId}:${new Date().toISOString().slice(0, 10)}`;
+  const used = (aiUsage.get(key) || 0) + 1;
+  aiUsage.set(key, used);
+  if (used > AI_DAILY_LIMIT) {
+    console.warn(`AI daily limit reached by user ${req.user.userId} (${req.user.email}) — ${used} calls.`);
+    return res.status(429).json({
+      error: "You've reached today's limit for AI help. It resets tomorrow — if you need more, message your teacher."
+    });
+  }
+  next();
+}
+
+// Convenience: the full middleware chain every AI endpoint should use.
+const aiGuard = [requireAuth, aiLimiter, aiQuota];
 
 // --- Database setup ---
 // DATABASE_URL is provided automatically by Render when you attach a Postgres database.
 const pool = process.env.DATABASE_URL
-  ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } })
+  ? new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: { rejectUnauthorized: false },
+      // Render's managed Postgres allows a limited number of concurrent connections, and it
+      // closes idle ones from its side. Keeping the pool small and recycling idle clients
+      // ourselves avoids hitting that ceiling and reduces how often we hold a dead socket.
+      max: 5,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 5000,
+    })
   : null;
+
+// Without this handler, when Postgres drops an idle connection the `pg` pool emits an 'error'
+// event with no listener — and an unhandled 'error' event takes down the entire Node process.
+// This was the most likely cause of unexplained restarts. Logging it is enough: the pool
+// discards the bad client and opens a fresh one on the next query.
+if (pool) {
+  pool.on('error', (err) => {
+    console.error('Idle Postgres client error (connection will be recycled):', err.message);
+  });
+}
 
 async function setupDatabase(){
   if (!pool) {
@@ -146,6 +243,27 @@ async function setupDatabase(){
   // those aggregate queries excludes users flagged here. Defaults to false so every existing
   // real student is unaffected.
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_demo BOOLEAN DEFAULT false;`);
+  // Additive migration: real role stored on the account instead of inferring "is this the
+  // teacher?" from a matching email address. The old email-based check was fragile — email is
+  // never verified at signup, so if ADMIN_EMAIL ever pointed at an address with no account
+  // yet, a student could register it and inherit admin access. It also could not be revoked,
+  // because the email was baked into a 30-day token.
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'student';`);
+  // Promote the configured admin email once, if that account exists. Safe to re-run.
+  if (process.env.ADMIN_EMAIL) {
+    const promoted = await pool.query(
+      `UPDATE users SET role = 'teacher' WHERE LOWER(email) = LOWER($1) AND role <> 'teacher' RETURNING id`,
+      [process.env.ADMIN_EMAIL.trim()]
+    );
+    if (promoted.rows.length) console.log(`Promoted ${process.env.ADMIN_EMAIL} to role=teacher.`);
+  }
+  // Additive migration: optional parent contact, used for the monthly progress report.
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS parent_email TEXT;`);
+  // Additive migration: lets us invalidate tokens issued before a password change. Without it,
+  // resetting a student's password did not actually cut off anyone already holding their old
+  // 30-day token. Defaults to NULL, which means "no reset has happened" — existing tokens for
+  // accounts that never reset stay valid, so nobody is logged out by this upgrade.
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMP;`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS exam_results (
       id SERIAL PRIMARY KEY,
@@ -214,6 +332,18 @@ async function setupDatabase(){
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_attempts_user_topic ON attempts (user_id, topic_id);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_attempts_topic ON attempts (topic_id);`);
+  // Used by the weekly digest and every "recent activity" window. This index used to be
+  // created at module load time, outside this function — on a fresh database that ran before
+  // the `attempts` table existed, and the failure was swallowed by an empty .catch().
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_attempts_created_at ON attempts (created_at);`);
+  // Supports the per-student mistake lookup that now feeds question/exam generation.
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_attempts_user_correct ON attempts (user_id, correct);`);
+
+  // Every /api/my/* page and the per-user counts on the admin users list filter by user_id.
+  // Without these, each one is a sequential scan over the whole table.
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_exam_results_user ON exam_results (user_id);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_study_plans_user ON study_plans (user_id);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_solver_history_user ON solver_history (user_id);`);
 
   // Teacher Intervention Log — lets a teacher note "I taught/reviewed X" so the dashboard
   // can later show before/after mastery around that moment. topic_id is nullable: an
@@ -254,6 +384,35 @@ async function setupDatabase(){
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_bookings_user ON bookings (user_id);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_bookings_status ON bookings (status);`);
 
+  // --- Spaced review queue ---
+  // Getting a question wrong once and never seeing it again is the biggest thing the app was
+  // missing pedagogically: the forgetting curve means a misconception corrected today is
+  // usually gone within a week unless it comes back. Every wrong answer now schedules itself
+  // for review, and each successful review pushes it further out (a Leitner-style box system):
+  //   box 0 -> due in 1 day, box 1 -> 3 days, box 2 -> 7 days, box 3 -> 21 days, box 4 -> done.
+  // Getting it wrong again on review knocks it back to box 0, so it returns tomorrow.
+  //
+  // One row per (student, topic, mistake_tag) rather than per individual question — the thing
+  // worth re-testing is the misconception, not the exact wording, and new questions targeting
+  // it are generated fresh at review time.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS review_queue (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      topic_id INTEGER REFERENCES topics(id) ON DELETE CASCADE,
+      mistake_tag TEXT,
+      box INTEGER NOT NULL DEFAULT 0,
+      due_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      times_reviewed INTEGER NOT NULL DEFAULT 0,
+      times_correct INTEGER NOT NULL DEFAULT 0,
+      retired BOOLEAN NOT NULL DEFAULT false,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW(),
+      UNIQUE (user_id, topic_id, mistake_tag)
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_review_due ON review_queue (user_id, retired, due_at);`);
+
   // Seed `topics` from the CURRICULUM in topics.js — safe to re-run, ON CONFLICT skips
   // anything already there. Keeps the canonical topic list in one place server-side.
   for (const grade of Object.keys(CURRICULUM)) {
@@ -284,10 +443,17 @@ async function resolveTopicId(grade, title){
     return null;
   }
 }
-setupDatabase().catch(err => console.error('Database setup failed:', err));
+// A failed setup used to be logged and then ignored, leaving the app serving requests against
+// a database with missing tables/columns — every route would fail in a confusing way. Exiting
+// makes the problem obvious in the Render logs and keeps the last good deploy live.
+setupDatabase().catch(err => {
+  console.error('FATAL: database setup failed:', err);
+  process.exit(1);
+});
 
 // --- Auth helpers ---
-const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
+// Validated at boot above, so no insecure fallback is needed here.
+const JWT_SECRET = process.env.JWT_SECRET;
 
 function signToken(user){
   return jwt.sign({ userId: user.id, name: user.name, email: user.email, grade: user.grade || null }, JWT_SECRET, { expiresIn: '30d' });
@@ -305,17 +471,77 @@ function optionalAuth(req, res, next){
 }
 app.use(optionalAuth);
 
-// Blocks the request unless a valid token is present
-function requireAuth(req, res, next){
+// Blocks the request unless a valid token is present, AND confirms the account still exists
+// and the token was issued after the last password reset. Loading the account row here means
+// requireAdmin (below) can reuse it instead of running a second query on admin routes.
+async function requireAuth(req, res, next){
   if (!req.user) return res.status(401).json({ error: 'Please log in first.' });
-  next();
+  if (!pool) return res.status(500).json({ error: 'No database connected on the server yet.' });
+  try {
+    // The "token is older than the last password reset" comparison is done in SQL, against the
+    // token's own `iat` claim. Doing it in JavaScript would compare a naive TIMESTAMP (which
+    // node-pg parses in the server's LOCAL timezone) against a UTC epoch — on a server set to
+    // anything other than UTC that silently shifts the cutoff by the offset, either leaving old
+    // tokens valid after a reset or rejecting freshly-issued ones and locking students out.
+    const result = await pool.query(
+      `SELECT id, name, email, grade, role, parent_email,
+              (password_changed_at IS NOT NULL AND $2::bigint IS NOT NULL
+               AND password_changed_at > to_timestamp($2::bigint)) AS token_is_stale
+         FROM users WHERE id = $1`,
+      [req.user.userId, req.user.iat || null]
+    );
+    const account = result.rows[0];
+    // The account was deleted while a valid token was still in circulation.
+    if (!account) return res.status(401).json({ error: 'This account no longer exists. Please log in again.' });
+    // The password was reset after this token was issued — force a fresh login.
+    if (account.token_is_stale) {
+      return res.status(401).json({ error: 'Your password was changed. Please log in again.' });
+    }
+
+    // Lazy admin promotion. The boot-time promotion in setupDatabase() only runs once, and only
+    // if ADMIN_EMAIL was already set AND the account already existed at that moment. Without
+    // this fallback, setting ADMIN_EMAIL after first deploy — or creating the teacher account
+    // after the server started — would leave NOBODY with role='teacher', permanently locking
+    // the admin and teacher dashboards behind a 403 until the next redeploy.
+    const adminEmail = (process.env.ADMIN_EMAIL || '').trim().toLowerCase();
+    if (adminEmail && account.role !== 'teacher' && (account.email || '').toLowerCase() === adminEmail) {
+      await pool.query(`UPDATE users SET role = 'teacher' WHERE id = $1`, [account.id]);
+      account.role = 'teacher';
+      console.log(`Promoted ${account.email} to role=teacher (lazy promotion).`);
+    }
+
+    req.account = account;
+    // Keep the token's grade in sync with the database, so an admin grade correction takes
+    // effect immediately instead of after the student's 30-day token expires.
+    req.user.grade = account.grade;
+    next();
+  } catch (err) {
+    console.error('Auth check failed:', err);
+    res.status(500).json({ error: 'Could not verify your session.' });
+  }
 }
 
+// Basic shape check only — deliberately permissive, since the goal is to catch typos like a
+// missing "@", not to police which addresses are valid.
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
 app.post('/api/register', authLimiter, async (req, res) => {
-  const { name, email, password, grade } = req.body;
+  const { name, email, password, grade, parentEmail } = req.body;
   if (!pool) return res.status(500).json({ error: 'No database connected on the server yet.' });
   if (!name || !email || !password) return res.status(400).json({ error: 'Name, email, and password are all required.' });
-  if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters.' });
+  if (typeof name !== 'string' || name.trim().length < 2 || name.length > 80) {
+    return res.status(400).json({ error: 'Please enter your real name.' });
+  }
+  if (typeof email !== 'string' || !EMAIL_RE.test(email.trim())) {
+    return res.status(400).json({ error: 'Please enter a valid email address.' });
+  }
+  if (typeof password !== 'string' || password.length < 8) {
+    return res.status(400).json({ error: 'Password must be at least 8 characters.' });
+  }
+  if (password.length > 200) return res.status(400).json({ error: 'That password is too long.' });
+  if (parentEmail && !EMAIL_RE.test(String(parentEmail).trim())) {
+    return res.status(400).json({ error: "Please enter a valid parent email, or leave it empty." });
+  }
   // Every student account is locked to one grade for good, chosen once at signup — see the
   // design note above the `grade` column migration. Validate against the real curriculum
   // grade keys so a typo or tampered request can't create an account with a bogus grade.
@@ -324,17 +550,20 @@ app.post('/api/register', authLimiter, async (req, res) => {
   }
 
   try {
-    const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email.toLowerCase()]);
-    if (existing.rows.length) return res.status(409).json({ error: 'An account with this email already exists.' });
-
+    // No check-then-insert: two rapid submissions could both pass the check and the second
+    // would fail with a raw duplicate-key 500. Let the UNIQUE constraint decide, and translate
+    // its error code into the correct 409.
     const hash = await bcrypt.hash(password, 10);
     const result = await pool.query(
-      'INSERT INTO users (name, email, password_hash, grade) VALUES ($1, $2, $3, $4) RETURNING id, name, email, grade',
-      [name, email.toLowerCase(), hash, grade]
+      'INSERT INTO users (name, email, password_hash, grade, parent_email) VALUES ($1, $2, $3, $4, $5) RETURNING id, name, email, grade',
+      [name.trim(), email.trim().toLowerCase(), hash, grade, parentEmail ? String(parentEmail).trim().toLowerCase() : null]
     );
     const user = result.rows[0];
     res.json({ token: signToken(user), name: user.name, email: user.email, grade: user.grade });
   } catch (err) {
+    if (err && err.code === '23505') {
+      return res.status(409).json({ error: 'An account with this email already exists.' });
+    }
     console.error('Register error:', err);
     res.status(500).json({ error: 'Something went wrong creating the account.' });
   }
@@ -379,6 +608,151 @@ app.get('/api/my/history', requireAuth, async (req, res) => {
   } catch (err) {
     console.error('History fetch error:', err);
     res.status(500).json({ error: 'Could not load your history.' });
+  }
+});
+
+// Review one past exam in full.
+//
+// Every graded exam already stored its complete question list, the student's per-part results
+// and the AI's feedback in exam_results.questions (JSONB) — but nothing ever read it back, so
+// a student could see "12/20" in their history and had no way to find out which parts they got
+// wrong or why. Reviewing a past mistake is one of the highest-value things a student can do,
+// and the data was sitting there the whole time.
+//
+// Scoped to the requesting user: the WHERE clause matches on user_id as well as id, so a
+// student cannot read another student's exam by guessing an id.
+app.get('/api/my/exams/:id', requireAuth, async (req, res) => {
+  if (!pool) return res.status(500).json({ error: 'No database connected on the server yet.' });
+  const examId = Number(req.params.id);
+  if (!Number.isInteger(examId) || examId <= 0) return res.status(400).json({ error: 'Invalid exam id.' });
+  try {
+    const result = await pool.query(
+      `SELECT id, grade, score, total, questions, created_at
+         FROM exam_results
+        WHERE id = $1 AND user_id = $2`,
+      [examId, req.user.userId]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: 'Exam not found.' });
+    const exam = result.rows[0];
+    const scorePct = exam.total ? Math.round((exam.score / exam.total) * 1000) / 10 : null;
+
+    // Exams graded before per-part results were stored have questions but no correct/feedback
+    // fields. Flag that explicitly so the review screen can say "detailed review isn't
+    // available for this one" instead of rendering a page of blank, apparently-ungraded parts.
+    const problems = Array.isArray(exam.questions) ? exam.questions : [];
+    const hasPartResults = problems.some(p =>
+      p && Array.isArray(p.parts) && p.parts.some(part => part && typeof part.correct === 'boolean')
+    );
+
+    res.json({ exam: { ...exam, scorePct, hasPartResults } });
+  } catch (err) {
+    console.error('Exam review fetch error:', err);
+    res.status(500).json({ error: 'Could not load this exam.' });
+  }
+});
+
+// --- Spaced review: what's due today ---
+// Cheap enough to call on every page load — it powers the "Review (N due)" badge.
+app.get('/api/my/review/due', requireAuth, async (req, res) => {
+  if (!pool) return res.status(500).json({ error: 'No database connected on the server yet.' });
+  try {
+    // The count is a separate query, NOT result.rows.length — the listing is capped at 20, so
+    // a student with 35 items due would see the badge stuck at "20" and it would not move as
+    // they cleared the first 15, making review look broken.
+    const [countRes, result] = await Promise.all([
+      pool.query(
+        `SELECT COUNT(*)::int AS n FROM review_queue
+          WHERE user_id = $1 AND retired = false AND due_at <= NOW()`,
+        [req.user.userId]
+      ),
+      pool.query(
+        `SELECT rq.id, rq.mistake_tag, rq.box, rq.due_at, t.title AS topic, t.grade
+           FROM review_queue rq
+           JOIN topics t ON t.id = rq.topic_id
+          WHERE rq.user_id = $1 AND rq.retired = false AND rq.due_at <= NOW()
+          ORDER BY rq.due_at ASC
+          LIMIT 20`,
+        [req.user.userId]
+      ),
+    ]);
+    // Group by topic so the UI can offer "review Energy (3 things)" rather than 3 separate items.
+    const byTopic = {};
+    result.rows.forEach(r => {
+      if (!byTopic[r.topic]) byTopic[r.topic] = { topic: r.topic, grade: r.grade, tags: [] };
+      byTopic[r.topic].tags.push(shortTagLabel(r.mistake_tag));
+    });
+    res.json({ dueCount: countRes.rows[0].n, topics: Object.values(byTopic) });
+  } catch (err) {
+    console.error('Review due fetch error:', err);
+    res.status(500).json({ error: 'Could not load your review queue.' });
+  }
+});
+
+// --- Spaced review: build today's review session ---
+// Generates NEW questions aimed squarely at the misconceptions that are due for this student on
+// this topic, rather than replaying the original wording — re-testing the understanding, not
+// the memory of one specific question. The returned questions carry `reviewTag` so that
+// /api/question-bank/grade (called with isReview: true) can update the right queue rows.
+app.post('/api/my/review/start', aiGuard, async (req, res) => {
+  if (!pool) return res.status(500).json({ error: 'No database connected on the server yet.' });
+  if (!process.env.GROQ_API_KEY) return res.status(500).json({ error: 'Server is missing its API key. Set GROQ_API_KEY in the environment.' });
+  const { topic, lang } = req.body;
+
+  try {
+    const due = await pool.query(
+      `SELECT rq.mistake_tag, rq.box, t.title AS topic, t.grade
+         FROM review_queue rq
+         JOIN topics t ON t.id = rq.topic_id
+        WHERE rq.user_id = $1 AND rq.retired = false AND rq.due_at <= NOW()
+          ${topic ? 'AND t.title = $2' : ''}
+        ORDER BY rq.due_at ASC
+        LIMIT 5`,
+      topic ? [req.user.userId, topic] : [req.user.userId]
+    );
+    if (!due.rows.length) {
+      return res.json({ questions: [], message: 'Nothing due for review right now — well done.' });
+    }
+
+    const grade = due.rows[0].grade;
+    const topicTitle = due.rows[0].topic;
+    const tags = [...new Set(due.rows.filter(r => r.topic === topicTitle).map(r => shortTagLabel(r.mistake_tag)))];
+    const n = Math.min(5, Math.max(2, tags.length + 1));
+
+    const grounding = styleGroundingFor(grade);
+    const userMessage = `Grade/branch: ${GRADE_LABELS[grade] || grade}
+Topic: ${topicTitle}
+Difficulty/style: medium
+Number of questions: ${n}${grounding ? `\n\n${grounding}` : ''}
+
+This is a SPACED REVIEW session. The student previously got these specific things wrong on this topic:
+${tags.map(t => `- ${t}`).join('\n')}
+Write questions that each re-test one of those specific weak points in a NEW situation — different numbers, different scenario, same underlying idea. Do not reuse the original wording, and do not mention that this is a review.`;
+
+    const text = await callGroq(withLanguage(QUESTION_BANK_GEN_SYSTEM_PROMPT, lang), userMessage, Math.min(1200, 200 + n * 120));
+    let questions;
+    try {
+      questions = extractJson(text);
+    } catch (e) {
+      console.error('Failed to parse review questions JSON:', text);
+      return res.status(502).json({ error: 'Could not build your review session. Try again.' });
+    }
+    const allowedTypes = (GRADE_STYLE_GUIDE[grade] && GRADE_STYLE_GUIDE[grade].types) || ['tf', 'mcq', 'problem'];
+    questions = questions.filter(q => q && allowedTypes.includes(q.type || 'problem'));
+    if (!questions.length) return res.status(502).json({ error: 'Could not build your review session. Try again.' });
+
+    // Tag each question with the misconception it is meant to re-test, cycling through the due
+    // list so every due item gets covered even if the model returned fewer questions than tags.
+    questions.forEach((q, i) => {
+      q.topic = topicTitle;
+      q.difficulty = 'medium';
+      q.reviewTag = tags[i % tags.length];
+    });
+    res.json({ grade, topic: topicTitle, questions, reviewing: tags });
+  } catch (err) {
+    if (err.message === 'groq_timeout') return res.status(504).json({ error: 'The AI service took too long to respond. Please try again in a moment.' });
+    if (err.message === 'groq_error') return res.status(502).json({ error: 'The AI service returned an error. Check the server logs.' });
+    console.error('Review start error:', err);
+    res.status(500).json({ error: 'Something went wrong on the server.' });
   }
 });
 
@@ -690,11 +1064,19 @@ app.patch('/api/my/bookings/:id/cancel', requireAuth, async (req, res) => {
 });
 
 // --- Admin ---
-// Set ADMIN_EMAIL in the environment to the email of the account that should have admin access.
+// Admin access is decided by the `role` column on the account, read fresh from the database on
+// every admin request — NOT by comparing against an email baked into the token.
+//
+// Why the change: email is never verified at signup, so the old check could be satisfied by
+// simply registering with the configured ADMIN_EMAIL if no account held it yet. And because
+// the email lived inside a 30-day token, admin access could not be revoked before it expired.
+// Reading the role live means demoting an account takes effect on the very next request.
+// The extra lookup is one indexed primary-key read, only on admin/teacher routes.
+// Always mount this AFTER requireAuth, which loads req.account.
 function requireAdmin(req, res, next){
-  if (!req.user) return res.status(401).json({ error: 'Please log in first.' });
-  const adminEmail = (process.env.ADMIN_EMAIL || '').toLowerCase();
-  if (!adminEmail || req.user.email.toLowerCase() !== adminEmail) {
+  if (!req.account) return res.status(401).json({ error: 'Please log in first.' });
+  const role = req.account.role;
+  if (role !== 'teacher' && role !== 'admin') {
     return res.status(403).json({ error: 'You do not have admin access.' });
   }
   next();
@@ -768,13 +1150,17 @@ app.post('/api/admin/users/:id/reset-password', requireAuth, requireAdmin, async
   if (!pool) return res.status(500).json({ error: 'No database connected on the server yet.' });
   try {
     // Short, readable temporary password (avoids visually ambiguous characters like 0/O/1/l).
+    // Uses crypto.randomInt, not Math.random — Math.random is predictable, and a password
+    // that grants access to a student's account should not be guessable from prior output.
     const chars = 'ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
     let tempPassword = '';
-    for (let i = 0; i < 8; i++) tempPassword += chars[Math.floor(Math.random() * chars.length)];
+    for (let i = 0; i < 10; i++) tempPassword += chars[crypto.randomInt(0, chars.length)];
 
     const hash = await bcrypt.hash(tempPassword, 10);
+    // password_changed_at invalidates any token issued before this reset — otherwise a student
+    // (or anyone holding their old 30-day token) keeps access even after the password changes.
     const result = await pool.query(
-      'UPDATE users SET password_hash = $1 WHERE id = $2 RETURNING id, name, email',
+      'UPDATE users SET password_hash = $1, password_changed_at = NOW() WHERE id = $2 RETURNING id, name, email',
       [hash, req.params.id]
     );
     if (!result.rows.length) return res.status(404).json({ error: 'Student not found.' });
@@ -1021,22 +1407,38 @@ app.get('/api/admin/weekly-digest', requireAuth, requireAdmin, async (req, res) 
 const GROQ_MODEL = 'openai/gpt-oss-20b';
 const GEMINI_MODEL = 'gemini-2.5-flash';
 
+// How long to wait on an AI provider before giving up. Without a timeout, a hung socket holds
+// the student's request open forever — they sit watching "Solving..." with no error, and on the
+// image-grading route it also holds a database connection out of a pool of five.
+const AI_TIMEOUT_MS = Number(process.env.AI_TIMEOUT_MS || 45000);
+
 async function callGroq(systemPrompt, userMessage, maxTokens){
-  const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': 'Bearer ' + process.env.GROQ_API_KEY,
-    },
-    body: JSON.stringify({
-      model: GROQ_MODEL,
-      max_tokens: maxTokens,
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userMessage },
-      ],
-    }),
-  });
+  let response;
+  try {
+    response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      signal: AbortSignal.timeout(AI_TIMEOUT_MS),
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + process.env.GROQ_API_KEY,
+      },
+      body: JSON.stringify({
+        model: GROQ_MODEL,
+        max_tokens: maxTokens,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userMessage },
+        ],
+      }),
+    });
+  } catch (err) {
+    if (err.name === 'TimeoutError' || err.name === 'AbortError') {
+      console.error(`Groq request timed out after ${AI_TIMEOUT_MS}ms`);
+      throw new Error('groq_timeout');
+    }
+    console.error('Groq request failed:', err.message);
+    throw new Error('groq_error');
+  }
 
   if (!response.ok) {
     const errText = await response.text();
@@ -1056,20 +1458,31 @@ async function callGemini(systemPrompt, userText, image){
   }
   parts.push({ text: userText || 'Solve the physics problem shown in this photo, step by step.' });
 
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-goog-api-key': process.env.GEMINI_API_KEY,
-      },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: systemPrompt }] },
-        contents: [{ parts }],
-      }),
+  let response;
+  try {
+    response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+      {
+        method: 'POST',
+        signal: AbortSignal.timeout(AI_TIMEOUT_MS),
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': process.env.GEMINI_API_KEY,
+        },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: systemPrompt }] },
+          contents: [{ parts }],
+        }),
+      }
+    );
+  } catch (err) {
+    if (err.name === 'TimeoutError' || err.name === 'AbortError') {
+      console.error(`Gemini request timed out after ${AI_TIMEOUT_MS}ms`);
+      throw new Error('gemini_timeout');
     }
-  );
+    console.error('Gemini request failed:', err.message);
+    throw new Error('gemini_error');
+  }
 
   if (!response.ok) {
     const errText = await response.text();
@@ -1164,7 +1577,7 @@ Rules:
 Respond with ONLY a single JSON array, nothing else — no markdown, no preamble. Format:
 [{"term": "terminal velocity", "meaning": "السرعة النهائية يلي بيوصلها الجسم وما بتزيد بعدها"}]`;
 
-app.post('/api/explain-terms', aiLimiter, async (req, res) => {
+app.post('/api/explain-terms', aiGuard, async (req, res) => {
   const { text } = req.body;
   if (!text || typeof text !== 'string' || !text.trim()) {
     return res.status(400).json({ error: 'Please provide the question text.' });
@@ -1187,6 +1600,7 @@ app.post('/api/explain-terms', aiLimiter, async (req, res) => {
     }
     res.json({ terms });
   } catch (err) {
+    if (err.message === 'groq_timeout') return res.status(504).json({ error: 'The AI service took too long to respond. Please try again in a moment.' });
     if (err.message === 'groq_error') {
       return res.status(502).json({ error: 'The AI service returned an error. Check the server logs.' });
     }
@@ -1195,7 +1609,7 @@ app.post('/api/explain-terms', aiLimiter, async (req, res) => {
   }
 });
 
-app.post('/api/solve', aiLimiter, async (req, res) => {
+app.post('/api/solve', aiGuard, async (req, res) => {
   // `grade` is optional and not sent by the UI today — if present (future UI change) it
   // narrows classification to that grade's topic list; if absent, classification searches
   // the whole curriculum and also guesses the grade.
@@ -1252,12 +1666,13 @@ app.post('/api/solve', aiLimiter, async (req, res) => {
             `INSERT INTO attempts (user_id, source, topic_id, question_text) VALUES ($1, 'solver', $2, $3)`,
             [req.user.userId, topicId, problem || '(photo)']
           ).catch(err => console.error('Failed to save solver attempt:', err));
-        });
-      });
+        }).catch(err => console.error('Solver topic resolution failed:', err));
+      }).catch(err => console.error('Solver topic classification failed:', err));
     }
 
     res.json({ steps, feedback });
   } catch (err) {
+    if (err.message === 'gemini_timeout') return res.status(504).json({ error: 'The AI service took too long to respond. Please try again in a moment.' });
     if (err.message === 'gemini_error') {
       return res.status(502).json({ error: 'The AI service returned an error. Check the server logs.' });
     }
@@ -1276,7 +1691,7 @@ Build a clear, realistic day-by-day (or every-2-3-days if there are many days) s
 - If the number of days is very tight relative to the number of lessons, say so honestly and prioritize the most important topics first, rather than pretending everything fits comfortably.
 Keep the tone encouraging but realistic. Format as a simple day-by-day list.`;
 
-app.post('/api/study-plan', aiLimiter, async (req, res) => {
+app.post('/api/study-plan', aiGuard, async (req, res) => {
   const { grade, examDate, daysLeft, lessons, otherExams, lang } = req.body;
 
   if (!grade || daysLeft === undefined || !lessons) {
@@ -1335,6 +1750,7 @@ Build my physics study plan.`;
 
     res.json({ plan: plan || 'No plan returned.' });
   } catch (err) {
+    if (err.message === 'groq_timeout') return res.status(504).json({ error: 'The AI service took too long to respond. Please try again in a moment.' });
     if (err.message === 'groq_error') {
       return res.status(502).json({ error: 'The AI service returned an error. Check the server logs.' });
     }
@@ -1411,7 +1827,7 @@ function extractJson(text){
   return match ? JSON.parse(match[0]) : JSON.parse(text);
 }
 
-app.post('/api/generate-exam', aiLimiter, async (req, res) => {
+app.post('/api/generate-exam', aiGuard, async (req, res) => {
   const { grade, lessons, lang } = req.body;
 
   if (!grade) {
@@ -1427,9 +1843,12 @@ app.post('/api/generate-exam', aiLimiter, async (req, res) => {
   const lessonList = chosenLessons && chosenLessons.length ? chosenLessons.join(', ') : 'general physics topics for this grade';
   const problemCount = examProblemCountFor(grade);
   const grounding = styleGroundingFor(grade);
-  const userMessage = `Grade/branch: ${GRADE_LABELS[grade] || grade}\nLessons to draw problems from (use these EXACT names for "topic"): ${lessonList}\nNumber of big problems to write: ${problemCount}${grounding ? `\n\n${grounding}` : ''}`;
 
   try {
+    // Personalised to this student's recorded misconceptions across the grade — a practice exam
+    // that quietly revisits what they keep getting wrong is worth far more than a random one.
+    const personal = await mistakeGroundingFor(req.user && req.user.userId, grade, null);
+    const userMessage = `Grade/branch: ${GRADE_LABELS[grade] || grade}\nLessons to draw problems from (use these EXACT names for "topic"): ${lessonList}\nNumber of big problems to write: ${problemCount}${grounding ? `\n\n${grounding}` : ''}${personal ? `\n\n${personal}` : ''}`;
     const text = await callGroq(withLanguage(EXAM_GEN_SYSTEM_PROMPT, lang), userMessage, Math.min(3500, 500 + problemCount * 550));
     let problems;
     try {
@@ -1440,6 +1859,7 @@ app.post('/api/generate-exam', aiLimiter, async (req, res) => {
     }
     res.json({ problems });
   } catch (err) {
+    if (err.message === 'groq_timeout') return res.status(504).json({ error: 'The AI service took too long to respond. Please try again in a moment.' });
     if (err.message === 'groq_error') {
       return res.status(502).json({ error: 'The AI service returned an error. Check the server logs.' });
     }
@@ -1448,7 +1868,7 @@ app.post('/api/generate-exam', aiLimiter, async (req, res) => {
   }
 });
 
-app.post('/api/grade-exam', aiLimiter, async (req, res) => {
+app.post('/api/grade-exam', aiGuard, async (req, res) => {
   // timeSpent is optional — an array of seconds per PROBLEM (not per part), same order as
   // `problems`. When absent every attempt is saved with time_spent_seconds = null.
   const { grade, problems, lang, timeSpent } = req.body;
@@ -1482,20 +1902,39 @@ app.post('/api/grade-exam', aiLimiter, async (req, res) => {
           overall_feedback: parsed.overall_feedback || '',
         };
       } catch (err) {
-        console.error('Failed to grade a problem (non-fatal, marked incorrect):', err.message || err);
+        // A grading FAILURE is not the same as the student being wrong. This used to return
+        // every part as correct:false, which then flowed into the score, a permanent
+        // exam_results row, one attempts row per part, and the spaced-review queue — so a
+        // single API timeout fabricated a 0/12 in the student's history, dragged down their
+        // mastery, the class analytics and the weekly digest, and scheduled reviews for
+        // misconceptions they never had. `graded: false` marks it as "no result" instead, and
+        // everything downstream skips it.
+        console.error('Failed to grade a problem (excluded from scoring):', err.message || err);
         return {
-          parts: p.parts.map(part => ({ label: part.label, correct: false, feedback: 'Could not grade this part — try resubmitting.' })),
-          overall_feedback: 'Grading failed for this problem — try again.',
+          graded: false,
+          parts: p.parts.map(part => ({ label: part.label, correct: null, feedback: 'This problem could not be graded — please resubmit it.' })),
+          overall_feedback: 'Grading failed for this problem, so it has been left out of your score. Try submitting it again.',
         };
       }
     }));
 
+    const ungradedCount = gradedProblems.filter(g => g.graded === false).length;
+    // If nothing could be graded at all, this is a service failure, not a 0% result — say so
+    // rather than handing the student a fake zero.
+    if (ungradedCount === gradedProblems.length) {
+      return res.status(502).json({
+        error: 'Your answers could not be graded right now — the AI service did not respond. Nothing was saved; please try submitting again in a moment.'
+      });
+    }
+
     // Score is counted at the PART level (a "big problem" is really several mini-questions),
     // which also keeps individual mistakes granular for the mistake-tag breakdown below.
+    // Problems that failed to grade are skipped entirely so they can't distort the score.
     let correctParts = 0, totalParts = 0;
     const mistakeCounts = {};
     const topicMissCounts = {};
     gradedProblems.forEach((g, pi) => {
+      if (g.graded === false) return;
       const topic = problems[pi].topic;
       g.parts.forEach(part => {
         totalParts++;
@@ -1517,15 +1956,42 @@ app.post('/api/grade-exam', aiLimiter, async (req, res) => {
       : (scorePct >= 85 ? 'Great job — no major gaps this time.' : 'Keep practicing — review your incorrect parts above.');
 
     if (pool && req.user) {
+      // Store the grading outcome alongside each part, not just the question text. Previously
+      // only the questions were saved, which meant a past exam could show a score but never
+      // "here is the part you got wrong, and why" — the single most useful thing to revisit.
+      // Only problems that actually graded are stored. `schemaVersion` lets the review screen
+      // tell this shape apart from rows written before per-part results were saved.
+      const reviewSnapshot = problems.map((p, pi) => {
+        const g = gradedProblems[pi] || {};
+        if (g.graded === false) return null;
+        return {
+          topic: p.topic,
+          difficulty: p.difficulty,
+          scenario: p.scenario,
+          parts: p.parts.map((part, parti) => {
+            const r = (g.parts && g.parts[parti]) || {};
+            return {
+              label: part.label,
+              question: part.question,
+              correct: !!r.correct,
+              feedback: r.feedback || null,
+              mistakeTag: r.correct ? null : (r.mistake_tag || null),
+            };
+          }),
+        };
+      }).filter(Boolean);
       pool.query(
         'INSERT INTO exam_results (user_id, grade, score, total, questions) VALUES ($1, $2, $3, $4, $5)',
-        [req.user.userId, grade, correctParts, totalParts, JSON.stringify(problems.map(p => ({ topic: p.topic, difficulty: p.difficulty, scenario: p.scenario, parts: p.parts })))]
+        [req.user.userId, grade, correctParts, totalParts, JSON.stringify(reviewSnapshot)]
       ).catch(err => console.error('Failed to save exam result:', err));
 
       // Unified data model: one `attempts` row per PART (not per photo/problem), fire-and-forget
       // so a slow/failed insert never blocks the response the student is waiting on.
       problems.forEach((p, pi) => {
         const g = gradedProblems[pi];
+        // A problem that failed to grade has no real result — recording it would invent a
+        // wrong answer the student never gave, and poison mastery and the review queue.
+        if (!g || g.graded === false) return;
         const spent = Array.isArray(timeSpent) ? (Number(timeSpent[pi]) || null) : null;
         resolveTopicId(grade, p.topic).then(topicId => {
           p.parts.forEach((part, parti) => {
@@ -1536,12 +2002,26 @@ app.post('/api/grade-exam', aiLimiter, async (req, res) => {
                VALUES ($1, 'exam', $2, $3, $4, $5, $6, $7, $8)`,
               [req.user.userId, topicId, p.difficulty || null, `(${part.label}) ${part.question}`, '(photo submission)', !!r.correct, r.correct ? null : (r.mistake_tag || 'other'), spent]
             ).catch(err => console.error('Failed to save exam attempt:', err));
+            // Every wrong part schedules its misconception for spaced review.
+            if (!r.correct) scheduleReview(req.user.userId, topicId, r.mistake_tag || 'other');
           });
-        });
+        }).catch(err => console.error('Exam topic resolution failed:', err));
       });
     }
 
-    res.json({ results: gradedProblems, score: correctParts, total: totalParts, scorePct, mistakeCounts, recommendedTopic, recommendedRevision });
+    res.json({
+      results: gradedProblems,
+      score: correctParts,
+      total: totalParts,
+      scorePct,
+      mistakeCounts,
+      recommendedTopic,
+      recommendedRevision,
+      // Lets the exam page tell the student which problems still need resubmitting, instead of
+      // showing them a silently-deflated score.
+      ungradedCount,
+      partiallyGraded: ungradedCount > 0,
+    });
   } catch (err) {
     console.error('Server error:', err);
     res.status(500).json({ error: 'Something went wrong on the server.' });
@@ -1572,6 +2052,61 @@ The array must have exactly the requested number of objects.`;
 
 const QUESTION_BANK_DIFFICULTIES = ['easy', 'medium', 'hard', 'examstyle', 'pastpaper'];
 
+// --- Mistake-aware generation ---
+// The `attempts` table has been recording a mistake_tag for every wrong answer since the
+// unified data model went in, but until now nothing read it back when generating new practice.
+// A student could get the same misconception wrong ten times and keep being served questions
+// picked purely from a difficulty dropdown.
+//
+// This looks up what this specific student actually gets wrong — first within the topic they
+// asked for, then (if there's nothing there yet) across their whole grade — and returns a short
+// instruction block for the generation prompt telling the model to target those misconceptions.
+// Returns '' when there's no history, so a brand-new student's experience is unchanged.
+async function mistakeGroundingFor(userId, grade, topicTitle){
+  if (!pool || !userId) return '';
+  try {
+    // Prefer mistakes on the exact topic; fall back to the student's grade-wide pattern so a
+    // first visit to a new topic still benefits from what we know about them.
+    const scoped = topicTitle ? await pool.query(
+      `SELECT a.mistake_tag, COUNT(*) AS cnt
+         FROM attempts a
+         JOIN topics t ON t.id = a.topic_id
+        WHERE a.user_id = $1 AND a.correct = false AND a.mistake_tag IS NOT NULL
+          AND t.grade = $2 AND t.title = $3
+          AND a.created_at > NOW() - INTERVAL '120 days'
+        GROUP BY a.mistake_tag ORDER BY cnt DESC LIMIT 3`,
+      [userId, grade, topicTitle]
+    ) : { rows: [] };
+
+    let rows = scoped.rows;
+    let scopeLabel = `on "${topicTitle}"`;
+    if (!rows.length) {
+      const wide = await pool.query(
+        `SELECT a.mistake_tag, COUNT(*) AS cnt
+           FROM attempts a
+           JOIN topics t ON t.id = a.topic_id
+          WHERE a.user_id = $1 AND a.correct = false AND a.mistake_tag IS NOT NULL
+            AND t.grade = $2
+            AND a.created_at > NOW() - INTERVAL '120 days'
+          GROUP BY a.mistake_tag ORDER BY cnt DESC LIMIT 3`,
+        [userId, grade]
+      );
+      rows = wide.rows;
+      scopeLabel = 'across this grade';
+    }
+    if (!rows.length) return '';
+
+    const list = rows.map(r => `- ${shortTagLabel(r.mistake_tag)} (got this wrong ${r.cnt} time${Number(r.cnt) === 1 ? '' : 's'})`).join('\n');
+    return `This student's recorded weak points ${scopeLabel}:
+${list}
+Deliberately include at least one question that targets the first weak point above, and where it fits naturally, a second targeting another. Do NOT mention this list, the student's history, or that any question is "targeted" — the questions must read exactly like ordinary practice questions.`;
+  } catch (err) {
+    // Personalisation is a bonus, never a requirement — a failure here must not block practice.
+    console.error('Mistake grounding lookup failed (continuing without it):', err.message);
+    return '';
+  }
+}
+
 // One short guiding hint for a student who's stuck on a practice question and hasn't
 // answered yet — same "never give the answer away" philosophy as the Solver, applied here so
 // a stuck student has somewhere to go besides leaving it blank or guessing.
@@ -1580,7 +2115,7 @@ Give ONE short guiding hint (1-2 sentences) — remind them which law/formula/co
 Do NOT give the final answer, any numeric result, or the full solution. Do not solve any part of the problem for them.
 Respond with ONLY the hint text, nothing else — no JSON, no markdown, no preamble.`;
 
-app.post('/api/question-bank/generate', aiLimiter, async (req, res) => {
+app.post('/api/question-bank/generate', aiGuard, async (req, res) => {
   const { grade, topic, difficulty, count, lang } = req.body;
   if (!grade || !CURRICULUM[grade]) return res.status(400).json({ error: 'Please provide a valid grade.' });
   if (!topic || !CURRICULUM[grade].includes(topic)) return res.status(400).json({ error: 'Unknown topic for this grade.' });
@@ -1591,7 +2126,8 @@ app.post('/api/question-bank/generate', aiLimiter, async (req, res) => {
 
   try {
     const grounding = styleGroundingFor(grade);
-    const userMessage = `Grade/branch: ${GRADE_LABELS[grade] || grade}\nTopic: ${topic}\nDifficulty/style: ${diff}\nNumber of questions: ${n}${grounding ? `\n\n${grounding}` : ''}`;
+    const personal = await mistakeGroundingFor(req.user && req.user.userId, grade, topic);
+    const userMessage = `Grade/branch: ${GRADE_LABELS[grade] || grade}\nTopic: ${topic}\nDifficulty/style: ${diff}\nNumber of questions: ${n}${grounding ? `\n\n${grounding}` : ''}${personal ? `\n\n${personal}` : ''}`;
     const text = await callGroq(withLanguage(QUESTION_BANK_GEN_SYSTEM_PROMPT, lang), userMessage, Math.min(1500, 200 + n * 120));
     let questions;
     try {
@@ -1613,6 +2149,7 @@ app.post('/api/question-bank/generate', aiLimiter, async (req, res) => {
     questions.forEach(q => { q.topic = topic; if (!q.difficulty) q.difficulty = diff; });
     res.json({ topic, difficulty: diff, questions });
   } catch (err) {
+    if (err.message === 'groq_timeout') return res.status(504).json({ error: 'The AI service took too long to respond. Please try again in a moment.' });
     if (err.message === 'groq_error') {
       return res.status(502).json({ error: 'The AI service returned an error. Check the server logs.' });
     }
@@ -1621,7 +2158,7 @@ app.post('/api/question-bank/generate', aiLimiter, async (req, res) => {
   }
 });
 
-app.post('/api/question-bank/hint', aiLimiter, async (req, res) => {
+app.post('/api/question-bank/hint', aiGuard, async (req, res) => {
   const { grade, topic, question, lang } = req.body;
   if (!question || typeof question !== 'string' || !question.trim()) {
     return res.status(400).json({ error: 'Please provide the question text.' });
@@ -1634,6 +2171,7 @@ app.post('/api/question-bank/hint', aiLimiter, async (req, res) => {
     const hint = await callGroq(withLanguage(QUESTION_BANK_HINT_SYSTEM_PROMPT, lang), userMessage, 120);
     res.json({ hint: (hint || '').trim() || 'Think about which law or formula applies here.' });
   } catch (err) {
+    if (err.message === 'groq_timeout') return res.status(504).json({ error: 'The AI service took too long to respond. Please try again in a moment.' });
     if (err.message === 'groq_error') {
       return res.status(502).json({ error: 'The AI service returned an error. Check the server logs.' });
     }
@@ -1642,8 +2180,8 @@ app.post('/api/question-bank/hint', aiLimiter, async (req, res) => {
   }
 });
 
-app.post('/api/question-bank/grade', aiLimiter, async (req, res) => {
-  const { grade, topic, questions, answers, lang } = req.body;
+app.post('/api/question-bank/grade', aiGuard, async (req, res) => {
+  const { grade, topic, questions, answers, lang, isReview } = req.body;
   if (!grade || !CURRICULUM[grade]) return res.status(400).json({ error: 'Please provide a valid grade.' });
   if (!topic || !CURRICULUM[grade].includes(topic)) return res.status(400).json({ error: 'Unknown topic for this grade.' });
   if (!Array.isArray(questions) || !Array.isArray(answers) || questions.length !== answers.length || !questions.length) {
@@ -1694,7 +2232,31 @@ app.post('/api/question-bank/grade', aiLimiter, async (req, res) => {
             [req.user.userId, topicId, (q && q.difficulty) || null, qText, answers[i], !!r.correct, r.correct ? null : (r.mistake_tag || 'other')]
           ).catch(err => console.error('Failed to save question bank attempt:', err));
         });
-      });
+        // Spaced review bookkeeping. When this set was served as a review session
+        // (isReview=true), the result updates the existing queue entry — right answers push the
+        // misconception further out, wrong ones bring it back tomorrow. Otherwise a wrong
+        // answer schedules it fresh.
+        if (isReview) {
+          // A review set deliberately contains MORE questions than due tags (see
+          // /api/my/review/start), so the same tag usually appears more than once. Aggregate
+          // per tag before deciding: the misconception only counts as re-learned if EVERY
+          // question testing it was right. Taking just the first result would let a student
+          // who got one right and one wrong keep advancing the box until it retired.
+          const byTag = new Map();
+          results.forEach((r, i) => {
+            const q = questions[i];
+            const tag = shortTagLabel((q && q.reviewTag) || r.mistake_tag || 'other');
+            byTag.set(tag, (byTag.get(tag) !== false) && !!r.correct);
+          });
+          byTag.forEach((allCorrect, tag) => {
+            recordReviewResult(req.user.userId, topicId, tag, allCorrect);
+          });
+        } else {
+          results.forEach(r => {
+            if (!r.correct) scheduleReview(req.user.userId, topicId, r.mistake_tag || 'other');
+          });
+        }
+      }).catch(err => console.error('Question bank topic resolution failed:', err));
     }
 
     const scorePct = Math.round((score / results.length) * 1000) / 10;
@@ -1706,6 +2268,7 @@ app.post('/api/question-bank/grade', aiLimiter, async (req, res) => {
 
     res.json({ results, score, total: results.length, scorePct, mistakeCounts, recommendedRevision });
   } catch (err) {
+    if (err.message === 'groq_timeout') return res.status(504).json({ error: 'The AI service took too long to respond. Please try again in a moment.' });
     if (err.message === 'groq_error') {
       return res.status(502).json({ error: 'The AI service returned an error. Check the server logs.' });
     }
@@ -1739,7 +2302,7 @@ The array must have exactly as many objects as there are questions, in the same 
 // POST /api/diagnostic/start — { grade, topicId } -> { topic, questions }. One question per
 // taxonomy tag for that topic (excluding the catch-all "other"), so a topic with few known
 // misconceptions gets a short quiz and one with many gets a longer one — no fixed count.
-app.post('/api/diagnostic/start', aiLimiter, async (req, res) => {
+app.post('/api/diagnostic/start', aiGuard, async (req, res) => {
   // Keyed by topic TITLE (not the DB-generated topic id) — the frontend's lesson list only
   // knows titles from CURRICULUM/GRADE_CONTENT, never the auto-assigned topics.id, so this
   // avoids making it fetch/resolve an id first just to start a diagnostic.
@@ -1764,6 +2327,7 @@ app.post('/api/diagnostic/start', aiLimiter, async (req, res) => {
     }
     res.json({ topic: topicTitle, questions });
   } catch (err) {
+    if (err.message === 'groq_timeout') return res.status(504).json({ error: 'The AI service took too long to respond. Please try again in a moment.' });
     if (err.message === 'groq_error') return res.status(502).json({ error: 'The AI service returned an error. Check the server logs.' });
     console.error('Diagnostic start error:', err);
     res.status(500).json({ error: 'Something went wrong on the server.' });
@@ -1774,7 +2338,7 @@ app.post('/api/diagnostic/start', aiLimiter, async (req, res) => {
 // needsReview / possibleMisconceptions, and saves one `attempts` row per question
 // (source='diagnostic') so it shows up in the Teacher Dashboard and future study plans
 // exactly like exam/lab attempts do.
-app.post('/api/diagnostic/grade', requireAuth, aiLimiter, async (req, res) => {
+app.post('/api/diagnostic/grade', aiGuard, async (req, res) => {
   const { grade, topic, questions, answers, lang } = req.body;
   if (!grade || !CURRICULUM[grade]) return res.status(400).json({ error: 'Please provide a valid grade.' });
   if (!topic || !CURRICULUM[grade].includes(topic)) return res.status(400).json({ error: 'Unknown topic for this grade.' });
@@ -1819,7 +2383,7 @@ app.post('/api/diagnostic/grade', requireAuth, aiLimiter, async (req, res) => {
           [req.user.userId, resolvedTopicId, q.question, answers[i], !!r.correct, r.correct ? null : (q.targetTag || 'other')]
         ).catch(err => console.error('Failed to save diagnostic attempt:', err));
       });
-    });
+    }).catch(err => console.error('Diagnostic topic resolution failed:', err));
 
     res.json({
       topic: topicTitle,
@@ -1829,6 +2393,7 @@ app.post('/api/diagnostic/grade', requireAuth, aiLimiter, async (req, res) => {
       results: questions.map((q, i) => ({ question: q.question, targetTag: q.targetTag, correct: !!(results[i] && results[i].correct), feedback: results[i] && results[i].feedback })),
     });
   } catch (err) {
+    if (err.message === 'groq_timeout') return res.status(504).json({ error: 'The AI service took too long to respond. Please try again in a moment.' });
     if (err.message === 'groq_error') return res.status(502).json({ error: 'The AI service returned an error. Check the server logs.' });
     console.error('Diagnostic grade error:', err);
     res.status(500).json({ error: 'Something went wrong on the server.' });
@@ -1837,6 +2402,64 @@ app.post('/api/diagnostic/grade', requireAuth, aiLimiter, async (req, res) => {
 
 // Strips the ": longer description" suffix some taxonomy tags carry, for short display labels.
 function shortTagLabel(tag){ return (tag || '').split(':')[0].trim(); }
+
+// --- Spaced review scheduling ---
+// Leitner intervals in days, indexed by box. Reaching the end retires the item: the student has
+// now got this misconception right four times across three weeks, which is a reasonable bar for
+// "learned" — and leaving retired rows in place (rather than deleting) keeps the history.
+const REVIEW_INTERVALS_DAYS = [1, 3, 7, 21];
+
+// Called fire-and-forget after grading. Upserts one row per (student, topic, misconception):
+// a repeat of the same mistake resets it to box 0 so it comes back tomorrow, rather than
+// creating a duplicate row.
+function scheduleReview(userId, topicId, mistakeTag){
+  if (!pool || !userId || !topicId) return Promise.resolve();
+  const tag = shortTagLabel(mistakeTag) || 'other';
+  return pool.query(
+    `INSERT INTO review_queue (user_id, topic_id, mistake_tag, box, due_at, updated_at)
+     VALUES ($1, $2, $3, 0, NOW() + INTERVAL '1 day', NOW())
+     ON CONFLICT (user_id, topic_id, mistake_tag)
+     DO UPDATE SET box = 0,
+                   due_at = NOW() + INTERVAL '1 day',
+                   retired = false,
+                   updated_at = NOW()`,
+    [userId, topicId, tag]
+  ).catch(err => console.error('Failed to schedule review:', err.message));
+}
+
+// Called after a review attempt. Correct -> advance a box (or retire); wrong -> back to box 0.
+function recordReviewResult(userId, topicId, mistakeTag, wasCorrect){
+  if (!pool || !userId || !topicId) return Promise.resolve();
+  const tag = shortTagLabel(mistakeTag) || 'other';
+  if (!wasCorrect) {
+    return pool.query(
+      `UPDATE review_queue
+          SET box = 0, due_at = NOW() + INTERVAL '1 day', retired = false,
+              times_reviewed = times_reviewed + 1, updated_at = NOW()
+        WHERE user_id = $1 AND topic_id = $2 AND mistake_tag = $3`,
+      [userId, topicId, tag]
+    ).catch(err => console.error('Failed to record review miss:', err.message));
+  }
+  // Correct: advance one box, and set the next due date from the box being moved INTO.
+  // The CASE mirrors REVIEW_INTERVALS_DAYS above (box 1 -> 3d, box 2 -> 7d, box 3 -> 21d);
+  // box 4 retires the item, so its interval never actually matters.
+  return pool.query(
+    `UPDATE review_queue
+        SET box = LEAST(box + 1, 4),
+            times_reviewed = times_reviewed + 1,
+            times_correct = times_correct + 1,
+            retired = (box + 1 >= 4),
+            due_at = NOW() + ((CASE box + 1
+                                 WHEN 1 THEN 3
+                                 WHEN 2 THEN 7
+                                 WHEN 3 THEN 21
+                                 ELSE 21
+                               END) * INTERVAL '1 day'),
+            updated_at = NOW()
+      WHERE user_id = $1 AND topic_id = $2 AND mistake_tag = $3`,
+    [userId, topicId, tag]
+  ).catch(err => console.error('Failed to record review hit:', err.message));
+}
 
 // --- Formula Library ---
 // The formulas themselves (plain strings, e.g. "F = ma") live in the frontend's curriculum.js
@@ -1847,7 +2470,8 @@ function shortTagLabel(tag){ return (tag || '').split(':')[0].trim(); }
 // much larger content project — this keeps it grounded in the real formula the student is
 // looking at instead of guessing/inventing new ones.
 const FORMULA_EXPLAIN_SYSTEM_PROMPT = `You are a physics teacher explaining ONE specific formula/law to a Lebanese high school student — the goal is for them to learn not just the formula, but when and why to reach for it.
-You will be given: grade/branch, the topic/chapter it belongs to, and the exact formula as written in the curriculum. Do not change or "correct" the formula — explain it exactly as given.
+You will be given: grade/branch, the topic/chapter it belongs to, the exact formula as written in the curriculum, and a grounding block describing how real Lebanese exams at this grade phrase things (units, constants, command verbs, given-value conventions). Do not change or "correct" the formula — explain it exactly as given.
+The "example" and "practiceQuestion"/"practiceAnswer" fields MUST follow the real Lebanese conventions in the grounding block (e.g. g = 10 m/s² or N/kg, not 9.8; a "Given:" style value list; command verbs like "Determine"/"Deduce"/"Calculate" rather than casual phrasing) — write these as if they were lifted from a real Lebanese exam at this grade, not a generic international textbook.
 Respond with ONLY a single JSON object, nothing else — no markdown, no preamble. Format:
 {
   "formula": "<the formula, copied exactly as given>",
@@ -1860,7 +2484,7 @@ Respond with ONLY a single JSON object, nothing else — no markdown, no preambl
 }
 List every distinct symbol that appears in the formula (skip universal constants like π unless central to it) in "symbols", in the order they appear. Keep everything concise and pitched at this grade level.`;
 
-app.post('/api/formula/explain', aiLimiter, async (req, res) => {
+app.post('/api/formula/explain', aiGuard, async (req, res) => {
   const { grade, topic, formula, lang } = req.body;
   if (!grade || !CURRICULUM[grade]) return res.status(400).json({ error: 'Please provide a valid grade.' });
   if (!topic || !CURRICULUM[grade].includes(topic)) return res.status(400).json({ error: 'Unknown topic for this grade.' });
@@ -1868,7 +2492,7 @@ app.post('/api/formula/explain', aiLimiter, async (req, res) => {
   if (!process.env.GROQ_API_KEY) return res.status(500).json({ error: 'Server is missing its API key. Set GROQ_API_KEY in the environment.' });
 
   try {
-    const userMessage = `Grade/branch: ${grade}\nTopic: ${topic}\nFormula: ${formula}`;
+    const userMessage = `Grade/branch: ${grade}\nTopic: ${topic}\nFormula: ${formula}\n\n${styleGroundingFor(grade)}`;
     const text = await callGroq(withLanguage(FORMULA_EXPLAIN_SYSTEM_PROMPT, lang), userMessage, 700);
     const match = text.match(/\{[\s\S]*\}/);
     let explanation;
@@ -1880,6 +2504,7 @@ app.post('/api/formula/explain', aiLimiter, async (req, res) => {
     }
     res.json({ explanation });
   } catch (err) {
+    if (err.message === 'groq_timeout') return res.status(504).json({ error: 'The AI service took too long to respond. Please try again in a moment.' });
     if (err.message === 'groq_error') {
       return res.status(502).json({ error: 'The AI service returned an error. Check the server logs.' });
     }
@@ -1903,7 +2528,7 @@ If incorrect, pick exactly one "mistake_tag" from the allowed list that best fit
 Respond with ONLY a single JSON object, nothing else — no markdown, no preamble. Format:
 {"correct": false, "feedback": "short explanation with the correct answer", "mistake_tag": "one-of-the-allowed-tags"}`;
 
-app.post('/api/lab-attempt', requireAuth, aiLimiter, async (req, res) => {
+app.post('/api/lab-attempt', aiGuard, async (req, res) => {
   const { grade, topic, question, answer, lang, timeSpent, pregraded, correct, feedback } = req.body;
 
   if (!grade || !topic || !question) {
@@ -1963,6 +2588,7 @@ app.post('/api/lab-attempt', requireAuth, aiLimiter, async (req, res) => {
 
     res.json({ result });
   } catch (err) {
+    if (err.message === 'groq_timeout') return res.status(504).json({ error: 'The AI service took too long to respond. Please try again in a moment.' });
     if (err.message === 'groq_error') {
       return res.status(502).json({ error: 'The AI service returned an error. Check the server logs.' });
     }
@@ -1977,9 +2603,8 @@ app.post('/api/lab-attempt', requireAuth, aiLimiter, async (req, res) => {
 // model. Mastery follows the section-4 rule: needs >=3 attempts before it's shown as a
 // number (fewer than that comes back as `null`, meaning "not enough data yet"), so a single
 // unlucky guess never reads as 0% mastery.
-if (pool) {
-  pool.query(`CREATE INDEX IF NOT EXISTS idx_attempts_created_at ON attempts (created_at);`).catch(() => {});
-}
+// (The idx_attempts_created_at index this section used to create at module load now lives in
+// setupDatabase(), where the `attempts` table is guaranteed to exist first.)
 
 // GET /api/teacher/class/:grade — per-topic breakdown for a whole grade.
 app.get('/api/teacher/class/:grade', requireAuth, requireAdmin, async (req, res) => {
@@ -2331,6 +2956,7 @@ app.post('/api/teacher/recommend', requireAuth, requireAdmin, aiLimiter, async (
     const recommendation = await callGroq(TEACH_NEXT_SYSTEM_PROMPT, `Grade: ${grade}\n\n${summaryLines}`, 300);
     res.json({ recommendation: recommendation || 'No recommendation returned.' });
   } catch (err) {
+    if (err.message === 'groq_timeout') return res.status(504).json({ error: 'The AI service took too long to respond. Please try again in a moment.' });
     if (err.message === 'groq_error') {
       return res.status(502).json({ error: 'The AI service returned an error. Check the server logs.' });
     }
@@ -2339,5 +2965,80 @@ app.post('/api/teacher/recommend', requireAuth, requireAdmin, aiLimiter, async (
   }
 });
 
+// --- 404 for unknown API routes ---
+// Without this, a typo'd API path falls through to Express's default handler and returns an
+// HTML error page, which the frontend then fails to parse as JSON and reports as a confusing
+// "unexpected token <" error instead of a clear "not found".
+app.use('/api/', (req, res) => {
+  res.status(404).json({ error: `Unknown API endpoint: ${req.method} ${req.originalUrl}` });
+});
+
+// --- Global error handler ---
+// Must be registered last, and must take four arguments for Express to recognise it as an
+// error handler. Anything thrown synchronously in a route, or passed to next(err), lands here
+// instead of returning an HTML stack trace. Notably this catches the CORS rejection above,
+// which previously produced an HTML response the frontend couldn't read.
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  if (err && err.message === 'Not allowed by CORS') {
+    return res.status(403).json({ error: 'This origin is not allowed to use the API.' });
+  }
+  if (err && err.type === 'entity.too.large') {
+    return res.status(413).json({ error: 'That upload is too large. Try a smaller or more compressed photo.' });
+  }
+  if (err && err.type === 'entity.parse.failed') {
+    return res.status(400).json({ error: 'The request body was not valid JSON.' });
+  }
+  console.error('Unhandled route error:', err);
+  res.status(500).json({ error: 'Something went wrong on the server.' });
+});
+
+// A rejected promise with no .catch() terminates the process on modern Node. Several places in
+// this file intentionally fire off "save this attempt" writes without awaiting them, so a
+// transient database blip should be logged rather than take the whole site down.
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled promise rejection (ignored, but should be investigated):', reason);
+});
+// An uncaught exception leaves the process in an undefined state — Node's own documentation is
+// explicit that resuming is unsafe. Logging and carrying on would keep a half-broken server
+// answering students while Render's health check still passes, so nobody would notice. Exiting
+// lets Render restart it cleanly.
+process.on('uncaughtException', (err) => {
+  console.error('FATAL uncaught exception — exiting so the platform can restart cleanly:', err);
+  process.exit(1);
+});
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Physics tutor backend running on port ${PORT}`));
+const server = app.listen(PORT, () => console.log(`Physics tutor backend running on port ${PORT}`));
+
+// --- Graceful shutdown ---
+// Render sends SIGTERM before replacing an instance. Without this, in-flight exam grading is
+// killed mid-request and the student sees a network error. Stop accepting new connections, let
+// current requests finish, then close the database pool.
+let shuttingDown = false;
+function shutdown(signal){
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`${signal} received — shutting down gracefully.`);
+
+  server.close(() => {
+    if (pool) pool.end().catch(() => {});
+    console.log('Closed out remaining connections.');
+    process.exit(0);
+  });
+
+  // server.close() waits for every open socket, and browsers hold keep-alive connections idle
+  // for minutes. Without this the close callback would essentially never fire and every deploy
+  // would fall through to the force path below. This drops idle sockets immediately while
+  // letting in-flight requests finish.
+  if (typeof server.closeIdleConnections === 'function') server.closeIdleConnections();
+
+  setTimeout(() => {
+    console.warn('Requests still in flight after 15s — closing remaining connections.');
+    if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
+    if (pool) pool.end().catch(() => {});
+    process.exit(0);
+  }, 15000).unref();
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
