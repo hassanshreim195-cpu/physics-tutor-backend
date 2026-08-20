@@ -413,6 +413,57 @@ async function setupDatabase(){
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_review_due ON review_queue (user_id, retired, due_at);`);
 
+  // --- Homework assignments ---
+  // The teacher sets work for a whole grade; each student gets their OWN generated question set
+  // for it. Two reasons that matters: copying a friend's answers is pointless when the numbers
+  // and scenarios differ, and every submission still flows through the normal grading path, so
+  // it feeds mastery, the mistake tags and the spaced-review queue like any other practice.
+  //
+  // Assignments target a grade rather than a hand-picked student list — that matches how this
+  // is actually used (a class is a grade here) and keeps the teacher's flow to a few clicks.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS assignments (
+      id SERIAL PRIMARY KEY,
+      teacher_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      grade TEXT NOT NULL,
+      topic_id INTEGER REFERENCES topics(id) ON DELETE CASCADE,
+      title TEXT NOT NULL,
+      instructions TEXT,
+      question_count INTEGER NOT NULL DEFAULT 6,
+      difficulty TEXT NOT NULL DEFAULT 'medium',
+      due_at TIMESTAMPTZ,
+      archived BOOLEAN NOT NULL DEFAULT false,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_assignments_grade ON assignments (grade, archived, due_at);`);
+
+  // One row per student per assignment. Created when the student opens it (status
+  // 'in_progress', questions stored so a refresh doesn't reshuffle their paper) and completed
+  // on submit. UNIQUE stops a student generating themselves an easier second set.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS assignment_submissions (
+      id SERIAL PRIMARY KEY,
+      assignment_id INTEGER NOT NULL REFERENCES assignments(id) ON DELETE CASCADE,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      status TEXT NOT NULL DEFAULT 'in_progress',
+      questions JSONB,
+      score INTEGER,
+      total INTEGER,
+      started_at TIMESTAMPTZ DEFAULT NOW(),
+      submitted_at TIMESTAMPTZ,
+      UNIQUE (assignment_id, user_id)
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_submissions_assignment ON assignment_submissions (assignment_id);`);
+  // Ties an attempt to the exact homework it came from. Without it, the teacher's "what did the
+  // class get wrong" panel had to guess by (topic + created after the assignment), which meant
+  // a second assignment on the same topic later in the year got folded into the first one's
+  // breakdown — permanently over-reporting it.
+  await pool.query(`ALTER TABLE attempts ADD COLUMN IF NOT EXISTS assignment_id INTEGER REFERENCES assignments(id) ON DELETE SET NULL;`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_attempts_assignment ON attempts (assignment_id);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_submissions_user ON assignment_submissions (user_id, status);`);
+
   // Seed `topics` from the CURRICULUM in topics.js — safe to re-run, ON CONFLICT skips
   // anything already there. Keeps the canonical topic list in one place server-side.
   for (const grade of Object.keys(CURRICULUM)) {
@@ -572,7 +623,11 @@ app.post('/api/register', authLimiter, async (req, res) => {
 app.post('/api/login', authLimiter, async (req, res) => {
   const { email, password } = req.body;
   if (!pool) return res.status(500).json({ error: 'No database connected on the server yet.' });
-  if (!email || !password) return res.status(400).json({ error: 'Email and password are required.' });
+  // Type checks, not just truthiness: a non-string email reached email.toLowerCase() and threw,
+  // returning a confusing 500 instead of a plain 400.
+  if (typeof email !== 'string' || typeof password !== 'string' || !email || !password) {
+    return res.status(400).json({ error: 'Email and password are required.' });
+  }
 
   try {
     const result = await pool.query('SELECT * FROM users WHERE email = $1', [email.toLowerCase()]);
@@ -651,6 +706,126 @@ app.get('/api/my/exams/:id', requireAuth, async (req, res) => {
   }
 });
 
+// --- Homework assignments (student side) ---
+
+// GET /api/my/assignments — what this student has been set, newest first.
+// Scoped to their own grade, so a student can only ever see work meant for them.
+app.get('/api/my/assignments', requireAuth, async (req, res) => {
+  if (!pool) return res.status(500).json({ error: 'No database connected on the server yet.' });
+  const grade = req.account && req.account.grade;
+  if (!grade) return res.json({ assignments: [], pendingCount: 0 });
+
+  try {
+    const result = await pool.query(
+      `SELECT a.id, a.title, a.instructions, a.question_count, a.difficulty, a.due_at, a.created_at,
+              t.title AS topic,
+              COALESCE(s.status, 'not_started') AS status,
+              s.score, s.total, s.submitted_at
+         FROM assignments a
+         JOIN topics t ON t.id = a.topic_id
+         LEFT JOIN assignment_submissions s ON s.assignment_id = a.id AND s.user_id = $1
+        WHERE a.grade = $2 AND a.archived = false
+        ORDER BY (COALESCE(s.status, 'not_started') = 'completed'),
+                 a.due_at ASC NULLS LAST, a.created_at DESC
+        LIMIT 30`,
+      [req.user.userId, grade]
+    );
+    const rows = result.rows.map(r => ({
+      ...r,
+      overdue: !!(r.due_at && r.status !== 'completed' && new Date(r.due_at).getTime() < Date.now()),
+    }));
+    res.json({
+      assignments: rows,
+      pendingCount: rows.filter(r => r.status !== 'completed').length,
+    });
+  } catch (err) {
+    console.error('My assignments error:', err);
+    res.status(500).json({ error: 'Could not load your assignments.' });
+  }
+});
+
+// POST /api/my/assignments/:id/start — get this student's own question set for an assignment.
+//
+// Questions are generated per student and then STORED. Two consequences that matter: two
+// students sitting together get different numbers and scenarios, so copying an answer across
+// is useless; and refreshing the page returns the same paper rather than rerolling until an
+// easier one appears.
+app.post('/api/my/assignments/:id/start', aiGuard, async (req, res) => {
+  if (!pool) return res.status(500).json({ error: 'No database connected on the server yet.' });
+  if (!process.env.GROQ_API_KEY) return res.status(500).json({ error: 'Server is missing its API key. Set GROQ_API_KEY in the environment.' });
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid assignment id.' });
+  const { lang } = req.body || {};
+
+  try {
+    const meta = await pool.query(
+      `SELECT a.id, a.grade, a.title, a.instructions, a.question_count, a.difficulty, a.due_at,
+              t.title AS topic
+         FROM assignments a JOIN topics t ON t.id = a.topic_id
+        WHERE a.id = $1 AND a.archived = false`,
+      [id]
+    );
+    if (!meta.rows.length) return res.status(404).json({ error: 'Assignment not found.' });
+    const a = meta.rows[0];
+    if (a.grade !== (req.account && req.account.grade)) {
+      return res.status(403).json({ error: 'This assignment is not for your grade.' });
+    }
+
+    // Already started or finished? Return what's on file rather than generating again.
+    const existing = await pool.query(
+      `SELECT status, questions, score, total FROM assignment_submissions
+        WHERE assignment_id = $1 AND user_id = $2`,
+      [id, req.user.userId]
+    );
+    if (existing.rows.length) {
+      const sub = existing.rows[0];
+      if (sub.status === 'completed') {
+        return res.status(409).json({ error: 'You have already submitted this assignment.', score: sub.score, total: sub.total });
+      }
+      if (Array.isArray(sub.questions) && sub.questions.length) {
+        return res.json({ assignment: a, grade: a.grade, topic: a.topic, questions: sub.questions, resumed: true });
+      }
+    }
+
+    const grounding = styleGroundingFor(a.grade);
+    const personal = await mistakeGroundingFor(req.user.userId, a.grade, a.topic);
+    const n = a.question_count;
+    const userMessage = `Grade/branch: ${GRADE_LABELS[a.grade] || a.grade}\nTopic: ${a.topic}\nDifficulty/style: ${a.difficulty}\nNumber of questions: ${n}${grounding ? `\n\n${grounding}` : ''}${personal ? `\n\n${personal}` : ''}`;
+    const text = await callGroq(withLanguage(QUESTION_BANK_GEN_SYSTEM_PROMPT, lang), userMessage, Math.min(6000, 400 + n * tokensPerQuestion(a.grade)));
+
+    let questions;
+    try {
+      questions = extractJson(text);
+    } catch (e) {
+      console.error(`Failed to parse assignment questions (id=${id}, grade=${a.grade}):`, e.message, '\nRAW:', text);
+      return res.status(502).json({ error: 'Could not build your questions. Please try again.' });
+    }
+    const allowedTypes = (GRADE_STYLE_GUIDE[a.grade] && GRADE_STYLE_GUIDE[a.grade].types) || ['tf', 'mcq', 'problem'];
+    const usable = questions.filter(Boolean);
+    const filtered = usable.filter(q => allowedTypes.includes(q.type || 'problem'));
+    questions = filtered.length ? filtered : usable;
+    if (!questions.length) return res.status(502).json({ error: 'Could not build your questions. Please try again.' });
+
+    questions.forEach(q => { q.topic = a.topic; if (!q.difficulty) q.difficulty = a.difficulty; });
+
+    // Upsert so a retry after a transient failure doesn't collide on the unique constraint.
+    await pool.query(
+      `INSERT INTO assignment_submissions (assignment_id, user_id, status, questions)
+       VALUES ($1, $2, 'in_progress', $3)
+       ON CONFLICT (assignment_id, user_id)
+       DO UPDATE SET questions = EXCLUDED.questions, status = 'in_progress', started_at = NOW()`,
+      [id, req.user.userId, JSON.stringify(questions)]
+    );
+
+    res.json({ assignment: a, grade: a.grade, topic: a.topic, questions, resumed: false });
+  } catch (err) {
+    if (err.message === 'groq_timeout') return res.status(504).json({ error: 'The AI service took too long to respond. Please try again in a moment.' });
+    if (err.message === 'groq_error') return res.status(502).json({ error: 'The AI service returned an error. Check the server logs.' });
+    console.error('Assignment start error:', err);
+    res.status(500).json({ error: 'Something went wrong on the server.' });
+  }
+});
+
 // --- Spaced review: what's due today ---
 // Cheap enough to call on every page load — it powers the "Review (N due)" badge.
 app.get('/api/my/review/due', requireAuth, async (req, res) => {
@@ -699,23 +874,35 @@ app.post('/api/my/review/start', aiGuard, async (req, res) => {
   const { topic, lang } = req.body;
 
   try {
+    // Filter on topic_id, not on the title. 14 topic titles are shared between grades
+    // ("Energy" is in both bacls and bacgs; "Radioactivity" is in three), so matching by title
+    // alone could pull in another grade's queue rows. The grading call later resolves a single
+    // topic_id from (grade, title) — if that resolved to the other grade's row, the update
+    // matched nothing and the item stayed due forever with the badge stuck on.
+    const topicId = req.body.topicId ? Number(req.body.topicId) : null;
     const due = await pool.query(
-      `SELECT rq.mistake_tag, rq.box, t.title AS topic, t.grade
+      `SELECT rq.topic_id, rq.mistake_tag, rq.box, t.title AS topic, t.grade
          FROM review_queue rq
          JOIN topics t ON t.id = rq.topic_id
         WHERE rq.user_id = $1 AND rq.retired = false AND rq.due_at <= NOW()
-          ${topic ? 'AND t.title = $2' : ''}
+          ${topicId ? 'AND rq.topic_id = $2' : (topic ? 'AND t.title = $2' : '')}
         ORDER BY rq.due_at ASC
-        LIMIT 5`,
-      topic ? [req.user.userId, topic] : [req.user.userId]
+        LIMIT 20`,
+      topicId ? [req.user.userId, topicId] : (topic ? [req.user.userId, topic] : [req.user.userId])
     );
     if (!due.rows.length) {
       return res.json({ questions: [], message: 'Nothing due for review right now — well done.' });
     }
 
-    const grade = due.rows[0].grade;
-    const topicTitle = due.rows[0].topic;
-    const tags = [...new Set(due.rows.filter(r => r.topic === topicTitle).map(r => shortTagLabel(r.mistake_tag)))];
+    // Work on ONE topic per session — the first one due — and take its tags by topic_id so a
+    // same-titled topic from another grade can never be mixed in.
+    const first = due.rows[0];
+    const grade = first.grade;
+    const topicTitle = first.topic;
+    const sessionTopicId = first.topic_id;
+    const tags = [...new Set(
+      due.rows.filter(r => r.topic_id === sessionTopicId).map(r => shortTagLabel(r.mistake_tag))
+    )].slice(0, 5);
     const n = Math.min(5, Math.max(2, tags.length + 1));
 
     const grounding = styleGroundingFor(grade);
@@ -728,14 +915,16 @@ This is a SPACED REVIEW session. The student previously got these specific thing
 ${tags.map(t => `- ${t}`).join('\n')}
 Write questions that each re-test one of those specific weak points in a NEW situation — different numbers, different scenario, same underlying idea. Do not reuse the original wording, and do not mention that this is a review.`;
 
-    const text = await callGroq(withLanguage(QUESTION_BANK_GEN_SYSTEM_PROMPT, lang), userMessage, Math.min(1200, 200 + n * 120));
+    const reviewMaxTokens = Math.min(6000, 400 + n * tokensPerQuestion(grade));
+    const text = await callGroq(withLanguage(QUESTION_BANK_GEN_SYSTEM_PROMPT, lang), userMessage, reviewMaxTokens);
     let questions;
     try {
       questions = extractJson(text);
     } catch (e) {
-      console.error('Failed to parse review questions JSON:', text);
-      return res.status(502).json({ error: 'Could not build your review session. Try again.' });
+      console.error(`Failed to parse review questions (grade=${grade}, maxTokens=${reviewMaxTokens}):`, e.message, '\nRAW:', text);
+      return res.status(502).json({ error: 'Could not build your review session. Please try again.' });
     }
+    if (!Array.isArray(questions)) questions = [];
     const allowedTypes = (GRADE_STYLE_GUIDE[grade] && GRADE_STYLE_GUIDE[grade].types) || ['tf', 'mcq', 'problem'];
     questions = questions.filter(q => q && allowedTypes.includes(q.type || 'problem'));
     if (!questions.length) return res.status(502).json({ error: 'Could not build your review session. Try again.' });
@@ -1546,8 +1735,7 @@ async function classifySolverTopic(problemText, solutionText, knownGrade){
   try {
     const userMessage = `Curriculum:\n${curriculumReference(knownGrade)}\n\n${knownGrade ? `Grade: ${knownGrade}\n` : ''}Problem: ${problemText || '(submitted as a photo, see solution for context)'}\nSolution: ${solutionText}`;
     const text = await callGroq(CLASSIFY_SYSTEM_PROMPT, userMessage, 100);
-    const match = text.match(/\{[\s\S]*\}/);
-    const parsed = JSON.parse(match ? match[0] : text);
+    const parsed = extractJsonObject(text);
     if (!parsed || !parsed.grade || !parsed.topic) return null;
     return { grade: parsed.grade, topic: parsed.topic };
   } catch (err) {
@@ -1628,8 +1816,7 @@ app.post('/api/solve', aiGuard, async (req, res) => {
 
     let parsed;
     try {
-      const match = raw.match(/\{[\s\S]*\}/);
-      parsed = JSON.parse(match ? match[0] : raw);
+      parsed = extractJsonObject(raw);
     } catch (e) {
       console.error('Failed to parse solver steps JSON:', raw);
       return res.status(502).json({ error: 'Could not generate a valid solution. Try again.' });
@@ -1734,12 +1921,12 @@ Days left until the exam: ${daysLeft}
 Physics lessons/topics still to cover:
 ${lessons}
 
-Other exams around the same time: ${otherExams && otherExams.trim() ? otherExams : 'None mentioned'}${diagnosticContext}
+Other exams around the same time: ${typeof otherExams === 'string' && otherExams.trim() ? otherExams : 'None mentioned'}${diagnosticContext}
 
 Build my physics study plan.`;
 
   try {
-    const plan = await callGroq(withLanguage(STUDY_PLAN_SYSTEM_PROMPT, lang), userMessage, 900);
+    const plan = await callGroq(withLanguage(STUDY_PLAN_SYSTEM_PROMPT, lang), userMessage, 2500);
 
     if (pool && req.user) {
       pool.query(
@@ -1773,6 +1960,24 @@ const EXAM_PROBLEM_COUNT = {
   g7: 3, g8: 3, g9: 3, g10: 3, g11lit: 3, bacse: 3,
   g11sci: 5, bacls: 5, bacgs: 5,
 };
+
+// How many output tokens to allow per generated question, by grade.
+//
+// This used to be inferred from whether a grade's allowed-type list contained "tf", which was
+// wrong for exactly the grades that matter most: Grade 9, 10 and 11-Scientific are
+// ["tf","problem"], so they were budgeted like short True/False grades while actually producing
+// long scaffolded problems. Truncation is what corrupts a whole generation or grading run, so
+// this is now set explicitly per grade — junior grades really do write short items, but from
+// Grade 10 up a single question carries a "Given:" block and lettered sub-parts.
+const TOKENS_PER_QUESTION = {
+  g7: 220, g8: 240, g9: 300,
+  g10: 380, g11lit: 380, g11sci: 420,
+  bacse: 380, bacls: 440, bacgs: 440,
+};
+function tokensPerQuestion(grade){
+  return TOKENS_PER_QUESTION[grade] || 380;
+}
+
 function examProblemCountFor(grade){
   return EXAM_PROBLEM_COUNT[grade] || 3;
 }
@@ -1822,9 +2027,162 @@ Respond with ONLY a single JSON object, nothing else — no markdown, no preambl
 {"parts": [{"label": "a", "correct": true, "feedback": "short explanation"}, {"label": "b", "correct": false, "feedback": "short explanation with the correct approach/answer", "mistake_tag": "one-of-the-allowed-tags"}], "overall_feedback": "one short encouraging sentence about this problem as a whole"}
 The "parts" array must have exactly as many objects as the problem has parts, in the same order, matching each "label".`;
 
+// Pulls a JSON array out of a model response.
+//
+// The old version was one greedy regex plus a straight JSON.parse, which threw on the single
+// most common real failure: a TRUNCATED response. When the model hits its max_tokens limit
+// mid-array there is no closing "]", the regex finds nothing, the raw parse throws, and the
+// student just sees "Could not generate practice questions" — even though nine perfectly good
+// questions arrived before the cut-off. Grade 11/12 questions are long multi-part problems, so
+// this happens far more often at the higher grades than at Grade 7.
+//
+// Strategy, in order: parse as-is, strip markdown fences, then repair a truncated array by
+// dropping the incomplete trailing object and closing the bracket.
 function extractJson(text){
-  const match = text.match(/\[[\s\S]*\]/);
-  return match ? JSON.parse(match[0]) : JSON.parse(text);
+  if (typeof text !== 'string') throw new Error('extractJson: expected a string');
+  // Callers all index, .map and .filter the result. Returning a bare object because the model
+  // wrapped the array ({"questions":[...]}) used to blow up later as "results.filter is not a
+  // function" — a 500 with no useful message. Enforce the contract here, once, and unwrap the
+  // common wrapper shapes instead of failing on them.
+  const asArray = (v) => {
+    if (Array.isArray(v)) return v;
+    if (v && typeof v === 'object') {
+      for (const key of ['questions', 'problems', 'results', 'items', 'data']) {
+        if (Array.isArray(v[key])) return v[key];
+      }
+    }
+    throw new Error('extractJson: response was not a JSON array');
+  };
+
+  let s = text.trim();
+
+  // Strip ```json ... ``` fences if present.
+  s = s.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim();
+
+  // Fast path: the whole thing is valid JSON.
+  try { return asArray(JSON.parse(s)); } catch (e) {
+    if (/not a JSON array/.test(e.message)) throw e;
+    /* otherwise fall through to extraction */
+  }
+
+  // Find where the array actually starts. Taking the FIRST "[" is wrong when the model writes a
+  // preamble that itself contains a bracket ("use [brackets] like this:") — that locks onto the
+  // prose and discards a perfectly good array further down. Only accept a "[" followed by
+  // something a JSON array can legally begin with.
+  const candidates = [];
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] !== '[') continue;
+    const next = s.slice(i + 1).match(/^\s*(.)/);
+    if (next && (next[1] === '{' || next[1] === '"' || next[1] === '[' || next[1] === ']' || /[0-9tfn-]/.test(next[1]))) {
+      candidates.push(i);
+    }
+  }
+  if (!candidates.length) throw new Error('extractJson: no JSON array found');
+
+  let body = null;
+  for (const start of candidates) {
+    const attempt = s.slice(start);
+    const complete = attempt.match(/\[[\s\S]*\]/);
+    if (complete) {
+      try { return asArray(JSON.parse(complete[0])); } catch (e) { /* try the next candidate */ }
+    }
+    if (body === null) body = attempt;
+  }
+  body = body || s.slice(candidates[0]);
+
+  // Repair a truncated array: keep everything up to the last complete top-level object.
+  // Walk the string tracking string literals/escapes so a "]" or "}" inside a question's text
+  // can't fool the depth count.
+  let depth = 0, inStr = false, esc = false, lastGoodEnd = -1;
+  for (let i = 0; i < body.length; i++) {
+    const c = body[i];
+    if (esc) { esc = false; continue; }
+    if (c === '\\') { esc = true; continue; }
+    if (c === '"') { inStr = !inStr; continue; }
+    if (inStr) continue;
+    if (c === '{') depth++;
+    else if (c === '}') { depth--; if (depth === 0) lastGoodEnd = i; }
+  }
+  if (lastGoodEnd !== -1) {
+    const repaired = body.slice(0, lastGoodEnd + 1) + ']';
+    const parsed = asArray(JSON.parse(repaired)); // if this throws, the caller's catch reports it
+    console.warn(`extractJson: response was truncated — recovered ${parsed.length} complete item(s).`);
+    return parsed;
+  }
+  throw new Error('extractJson: could not parse or repair the response');
+}
+
+// Object counterpart of extractJson, for the routes that expect a single JSON object rather
+// than an array (formula explanations, exam-part grading, the solver, key terms, lab grading).
+// Those all used a bare `text.match(/\{[\s\S]*\}/)` + JSON.parse, which has the same truncation
+// weakness: one missing closing brace and the whole response is discarded.
+//
+// Repair strategy: close any string still open, then add the braces/brackets needed to balance
+// what was opened. A trailing incomplete key/value is trimmed first. This recovers the fields
+// that did arrive instead of losing the entire explanation.
+function extractJsonObject(text){
+  if (typeof text !== 'string') throw new Error('extractJsonObject: expected a string');
+  // Callers dereference fields on the result. A bare array, a string, or literal `null` all
+  // parse successfully and then throw further down as "cannot read property of null" — a 500
+  // instead of a clean "try again". Enforce the shape here.
+  const asObject = (v) => {
+    if (v && typeof v === 'object' && !Array.isArray(v)) return v;
+    throw new Error('extractJsonObject: response was not a JSON object');
+  };
+
+  let s = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim();
+
+  try { return asObject(JSON.parse(s)); } catch (e) {
+    if (/not a JSON object/.test(e.message)) throw e;
+    /* otherwise fall through to extraction */
+  }
+
+  const start = s.indexOf('{');
+  if (start === -1) throw new Error('extractJsonObject: no JSON object found');
+  let body = s.slice(start);
+
+  const complete = body.match(/\{[\s\S]*\}/);
+  if (complete) {
+    try { return asObject(JSON.parse(complete[0])); } catch (e) { /* fall through to repair */ }
+  }
+
+  // Find the last point where a complete key/value pair had just finished — that is, the last
+  // comma or closing bracket that was NOT inside a string literal. Everything after it is a
+  // half-written pair (a truncated value, or a key with no value) and gets dropped wholesale.
+  let inStr = false, esc = false, lastComplete = -1;
+  for (let i = 0; i < body.length; i++) {
+    const c = body[i];
+    if (esc) { esc = false; continue; }
+    if (c === '\\') { esc = true; continue; }
+    if (c === '"') { inStr = !inStr; continue; }
+    if (inStr) continue;
+    if (c === ',' || c === '}' || c === ']') lastComplete = i;
+  }
+  if (lastComplete === -1) throw new Error('extractJsonObject: nothing recoverable');
+
+  // Cut before a trailing comma; keep a closing bracket.
+  let repaired = body[lastComplete] === ','
+    ? body.slice(0, lastComplete)
+    : body.slice(0, lastComplete + 1);
+
+  // Close whatever structures are still open, innermost first.
+  const open = [];
+  let inStr2 = false, esc2 = false;
+  for (let i = 0; i < repaired.length; i++) {
+    const c = repaired[i];
+    if (esc2) { esc2 = false; continue; }
+    if (c === '\\') { esc2 = true; continue; }
+    if (c === '"') { inStr2 = !inStr2; continue; }
+    if (inStr2) continue;
+    if (c === '{') open.push('}');
+    else if (c === '[') open.push(']');
+    else if (c === '}' || c === ']') open.pop();
+  }
+  while (open.length) repaired += open.pop();
+
+  const parsed = asObject(JSON.parse(repaired));
+  console.warn('extractJsonObject: response was truncated — recovered the fields that arrived.');
+  return parsed;
 }
 
 app.post('/api/generate-exam', aiGuard, async (req, res) => {
@@ -1849,13 +2207,23 @@ app.post('/api/generate-exam', aiGuard, async (req, res) => {
     // that quietly revisits what they keep getting wrong is worth far more than a random one.
     const personal = await mistakeGroundingFor(req.user && req.user.userId, grade, null);
     const userMessage = `Grade/branch: ${GRADE_LABELS[grade] || grade}\nLessons to draw problems from (use these EXACT names for "topic"): ${lessonList}\nNumber of big problems to write: ${problemCount}${grounding ? `\n\n${grounding}` : ''}${personal ? `\n\n${personal}` : ''}`;
-    const text = await callGroq(withLanguage(EXAM_GEN_SYSTEM_PROMPT, lang), userMessage, Math.min(3500, 500 + problemCount * 550));
+    // Each "big problem" carries a scenario, a Given: block and several lettered sub-parts —
+    // and at Grade 11/12 those are long. 550 tokens per problem (old ceiling 3500) was cutting
+    // the array off partway through, which used to discard the entire exam.
+    const examMaxTokens = Math.min(8000, 600 + problemCount * 1100);
+    const text = await callGroq(withLanguage(EXAM_GEN_SYSTEM_PROMPT, lang), userMessage, examMaxTokens);
     let problems;
     try {
       problems = extractJson(text);
     } catch (e) {
-      console.error('Failed to parse exam problems JSON:', text);
-      return res.status(502).json({ error: 'Could not generate a valid exam. Try again.' });
+      console.error(`Failed to parse exam problems (grade=${grade}, count=${problemCount}, maxTokens=${examMaxTokens}, len=${text.length}):`, e.message, '\nRAW:', text);
+      return res.status(502).json({ error: 'The exam came back in an unreadable format. Please try again.' });
+    }
+    // A truncated response can still yield a usable, shorter exam — but not an empty one.
+    problems = (Array.isArray(problems) ? problems : []).filter(p => p && Array.isArray(p.parts) && p.parts.length);
+    if (!problems.length) {
+      console.error(`No complete problems survived parsing (grade=${grade}). RAW:`, text);
+      return res.status(502).json({ error: 'Could not generate a valid exam. Please try again.' });
     }
     res.json({ problems });
   } catch (err) {
@@ -1895,10 +2263,31 @@ app.post('/api/grade-exam', aiGuard, async (req, res) => {
       const userText = `Topic: ${p.topic || 'Unknown'}\nScenario: ${p.scenario || ''}\nParts:\n${partsText}\nAllowed mistake tags if a part is incorrect: ${allowedTags}`;
       try {
         const text = await callGemini(withLanguage(EXAM_PROBLEM_GRADE_SYSTEM_PROMPT, lang), userText, p.image);
-        const match = text.match(/\{[\s\S]*\}/);
-        const parsed = JSON.parse(match ? match[0] : text);
+        const parsed = extractJsonObject(text);
+
+        // Only accept a result that actually grades EVERY part with a real true/false verdict.
+        //
+        // Two ways this used to go wrong, both producing wrong answers the student never gave:
+        //   1. The model returns valid JSON with no `parts` array at all (a refusal, or "the
+        //      photo is unreadable"). The old fallback turned that into every part marked wrong
+        //      — and, unlike the catch branch, it was recorded as a SUCCESSFUL grade.
+        //   2. The response is truncated. extractJsonObject now repairs it, which means a
+        //      partial `parts` array parses cleanly — the last entry has no `correct` key at
+        //      all, and `!!undefined` scored it as wrong.
+        // Both are grading failures, not student failures, so they must throw into the catch
+        // below and be excluded from the score, the database and the review queue.
+        if (!Array.isArray(parsed.parts)) {
+          throw new Error('grader returned no parts array');
+        }
+        if (parsed.parts.length !== p.parts.length) {
+          throw new Error(`grader returned ${parsed.parts.length} part(s) for a ${p.parts.length}-part problem`);
+        }
+        if (!parsed.parts.every(r => r && typeof r.correct === 'boolean')) {
+          throw new Error('grader returned a part with no true/false verdict');
+        }
         return {
-          parts: Array.isArray(parsed.parts) ? parsed.parts : p.parts.map(part => ({ label: part.label, correct: false, feedback: 'Could not read a result for this part.' })),
+          graded: true,
+          parts: parsed.parts,
           overall_feedback: parsed.overall_feedback || '',
         };
       } catch (err) {
@@ -2128,20 +2517,35 @@ app.post('/api/question-bank/generate', aiGuard, async (req, res) => {
     const grounding = styleGroundingFor(grade);
     const personal = await mistakeGroundingFor(req.user && req.user.userId, grade, topic);
     const userMessage = `Grade/branch: ${GRADE_LABELS[grade] || grade}\nTopic: ${topic}\nDifficulty/style: ${diff}\nNumber of questions: ${n}${grounding ? `\n\n${grounding}` : ''}${personal ? `\n\n${personal}` : ''}`;
-    const text = await callGroq(withLanguage(QUESTION_BANK_GEN_SYSTEM_PROMPT, lang), userMessage, Math.min(1500, 200 + n * 120));
+    const maxTokens = Math.min(6000, 400 + n * tokensPerQuestion(grade));
+    const text = await callGroq(withLanguage(QUESTION_BANK_GEN_SYSTEM_PROMPT, lang), userMessage, maxTokens);
     let questions;
     try {
       questions = extractJson(text);
     } catch (e) {
-      console.error('Failed to parse question bank JSON:', text);
-      return res.status(502).json({ error: 'Could not generate practice questions. Try again.' });
+      console.error(`Failed to parse question bank JSON (grade=${grade}, topic="${topic}", maxTokens=${maxTokens}, len=${text.length}):`, e.message, '\nRAW:', text);
+      return res.status(502).json({ error: 'The practice questions came back in an unreadable format. Please try again.' });
+    }
+    if (!Array.isArray(questions)) {
+      console.error(`Question bank response was not an array (grade=${grade}):`, text);
+      return res.status(502).json({ error: 'The practice questions came back in an unexpected shape. Please try again.' });
     }
     // Defensive filter: keep only the types real exams actually use at this grade, in case the
     // model drifts (e.g. slips in an MCQ for Grade 12, which never uses one in practice).
     const allowedTypes = (GRADE_STYLE_GUIDE[grade] && GRADE_STYLE_GUIDE[grade].types) || ['tf', 'mcq', 'problem'];
-    questions = questions.filter(q => q && allowedTypes.includes(q.type || 'problem'));
-    if (!questions.length) {
-      console.error('All generated questions were filtered out for grade', grade, '- raw:', text);
+    const beforeFilter = questions.filter(Boolean);
+    const filtered = beforeFilter.filter(q => allowedTypes.includes(q.type || 'problem'));
+    if (filtered.length) {
+      questions = filtered;
+    } else if (beforeFilter.length) {
+      // The model returned usable questions, but all in a type this grade doesn't normally use.
+      // Showing slightly off-style questions is much better than showing the student an error
+      // and nothing to practise with — so fall back to the unfiltered set and log it loudly so
+      // the grade's type list in curriculum_style.js can be corrected.
+      console.warn(`Type filter emptied the set for grade "${grade}" (allowed: ${allowedTypes.join(', ')}; got: ${[...new Set(beforeFilter.map(q => q.type || 'problem'))].join(', ')}). Serving unfiltered.`);
+      questions = beforeFilter;
+    } else {
+      console.error('No usable questions returned for grade', grade, '- raw:', text);
       return res.status(502).json({ error: 'Could not generate practice questions. Try again.' });
     }
     // Stamp topic (and difficulty, as a fallback) on every question so grading/mistake-tagging
@@ -2181,32 +2585,104 @@ app.post('/api/question-bank/hint', aiGuard, async (req, res) => {
 });
 
 app.post('/api/question-bank/grade', aiGuard, async (req, res) => {
-  const { grade, topic, questions, answers, lang, isReview } = req.body;
+  // assignmentId marks this as a homework submission. It reuses this whole route rather than
+  // duplicating the grading pipeline — the only difference is that the result is also recorded
+  // against the assignment, and the attempts are tagged source='assignment' so the teacher's
+  // per-assignment mistake breakdown can find them.
+  const { answers, lang, isReview, assignmentId } = req.body;
+  let { grade, topic, questions } = req.body;
+  if (!process.env.GROQ_API_KEY) {
+    return res.status(500).json({ error: 'Server is missing its API key. Set GROQ_API_KEY in the environment.' });
+  }
+
+  // --- Homework: grade the paper we issued, never the one the browser sends back ---
+  //
+  // Without this, marking homework was trivially cheatable: a student could call this endpoint
+  // with their real assignmentId but one easy question of their own ("Is 1+1=2?"), and the
+  // teacher's gradebook would record 1/1 = 100%. Everything that decides the grade — the
+  // questions, the topic and the grade key — is therefore re-read from the stored submission
+  // and overrides whatever arrived in the body. The client's `answers` are the only thing it
+  // is trusted to supply.
+  //
+  // Loading the row first also lets an already-submitted or never-started assignment be
+  // rejected BEFORE any AI call, which stops a resubmit from double-writing attempts, mastery
+  // and the review queue (and from spending another unit of the student's daily AI budget).
+  let assignmentRow = null;
+  if (assignmentId !== undefined && assignmentId !== null) {
+    const aId = Number(assignmentId);
+    if (!Number.isInteger(aId) || aId <= 0) return res.status(400).json({ error: 'Invalid assignment id.' });
+    if (!pool) return res.status(500).json({ error: 'No database connected on the server yet.' });
+    try {
+      const found = await pool.query(
+        `SELECT s.questions, s.status, a.id AS assignment_id, a.grade, a.archived, t.title AS topic
+           FROM assignment_submissions s
+           JOIN assignments a ON a.id = s.assignment_id
+           JOIN topics t ON t.id = a.topic_id
+          WHERE s.assignment_id = $1 AND s.user_id = $2`,
+        [aId, req.user.userId]
+      );
+      if (!found.rows.length) {
+        return res.status(404).json({ error: "You haven't started this homework yet. Open it from your dashboard first." });
+      }
+      assignmentRow = found.rows[0];
+      if (assignmentRow.status === 'completed') {
+        return res.status(409).json({ error: 'You have already handed this homework in.', alreadySubmitted: true });
+      }
+      if (!Array.isArray(assignmentRow.questions) || !assignmentRow.questions.length) {
+        return res.status(409).json({ error: 'Your question set could not be found. Please open the homework again from your dashboard.' });
+      }
+      // Authoritative values, replacing anything the client sent.
+      questions = assignmentRow.questions;
+      grade = assignmentRow.grade;
+      topic = assignmentRow.topic;
+    } catch (err) {
+      console.error('Assignment lookup failed:', err);
+      return res.status(500).json({ error: 'Could not check this homework. Please try again.' });
+    }
+  }
+
   if (!grade || !CURRICULUM[grade]) return res.status(400).json({ error: 'Please provide a valid grade.' });
   if (!topic || !CURRICULUM[grade].includes(topic)) return res.status(400).json({ error: 'Unknown topic for this grade.' });
   if (!Array.isArray(questions) || !Array.isArray(answers) || questions.length !== answers.length || !questions.length) {
     return res.status(400).json({ error: 'Please provide matching questions and answers.' });
   }
-  if (!process.env.GROQ_API_KEY) {
-    return res.status(500).json({ error: 'Server is missing its API key. Set GROQ_API_KEY in the environment.' });
+
+  // Every element must be usable before we build the prompt. This used to run OUTSIDE the try
+  // block below, so a null entry threw a TypeError that Express could not catch — the request
+  // then hung with no response at all until the browser gave up.
+  if (!questions.every(q => typeof q === 'string' || (q && typeof q.question === 'string'))) {
+    return res.status(400).json({ error: 'One of the questions was malformed. Please regenerate the set.' });
   }
 
-  const pairs = questions.map((q, i) => {
-    const qText = typeof q === 'string' ? q : q.question;
-    const qType = typeof q === 'string' ? 'problem' : (q.type || 'problem');
-    const choicesLine = (qType === 'mcq' && Array.isArray(q.choices)) ? `\nChoices: ${q.choices.join(', ')}` : '';
-    return `Q${i + 1} (${qType}): ${qText}${choicesLine}\nAllowed mistake tags if incorrect: ${tagsForTopic(topic).join(', ')}\nStudent's answer: ${answers[i]}`;
-  }).join('\n\n');
-  const userMessage = `Grade/branch: ${grade}\nTopic: ${topic}\n\n${pairs}`;
-
   try {
-    const text = await callGroq(withLanguage(EXAM_GRADE_SYSTEM_PROMPT, lang), userMessage, 900);
+    const pairs = questions.map((q, i) => {
+      const qText = typeof q === 'string' ? q : q.question;
+      const qType = typeof q === 'string' ? 'problem' : (q.type || 'problem');
+      const choicesLine = (qType === 'mcq' && Array.isArray(q.choices)) ? `\nChoices: ${q.choices.join(', ')}` : '';
+      return `Q${i + 1} (${qType}): ${qText}${choicesLine}\nAllowed mistake tags if incorrect: ${tagsForTopic(topic).join(', ')}\nStudent's answer: ${answers[i]}`;
+    }).join('\n\n');
+    const userMessage = `Grade/branch: ${grade}\nTopic: ${topic}\n\n${pairs}`;
+
+    const text = await callGroq(withLanguage(EXAM_GRADE_SYSTEM_PROMPT, lang), userMessage, Math.min(3000, 300 + questions.length * 180));
     let results;
     try {
       results = extractJson(text);
     } catch (e) {
-      console.error('Failed to parse question bank grading JSON:', text);
-      return res.status(502).json({ error: 'Could not grade this set. Try again.' });
+      console.error(`Failed to parse question bank grading (grade=${grade}, topic="${topic}", n=${questions.length}):`, e.message, '\nRAW:', text);
+      return res.status(502).json({ error: 'Could not grade this set. Please try again.' });
+    }
+
+    // The grader must return one verdict per question. A short array (truncated response) used
+    // to be padded silently with `results[i] || {}`, which recorded every ungraded question as
+    // WRONG in the database while showing the student no badge for it at all — an invented
+    // mistake that then fed mastery, the teacher dashboard and the spaced-review queue.
+    if (results.length !== questions.length) {
+      console.error(`Grader returned ${results.length} result(s) for ${questions.length} question(s) — rejecting rather than guessing.`);
+      return res.status(502).json({ error: 'Grading came back incomplete. Please submit again.' });
+    }
+    if (!results.every(r => r && typeof r.correct === 'boolean')) {
+      console.error('Grader returned an entry with no true/false verdict — rejecting.');
+      return res.status(502).json({ error: 'Grading came back incomplete. Please submit again.' });
     }
 
     const score = results.filter(r => r.correct).length;
@@ -2221,15 +2697,21 @@ app.post('/api/question-bank/grade', aiGuard, async (req, res) => {
       }
     });
 
+    // Only tag as homework once the submission row has actually been verified above — otherwise
+    // any student could post a made-up assignmentId and inject rows into the teacher's
+    // per-assignment mistake breakdown without ever being set that homework.
+    const attemptSource = assignmentRow ? 'assignment' : 'question_bank';
+    const attemptAssignmentId = assignmentRow ? assignmentRow.assignment_id : null;
+
     if (pool && req.user) {
       resolveTopicId(grade, topic).then(topicId => {
         questions.forEach((q, i) => {
           const qText = typeof q === 'string' ? q : q.question;
           const r = results[i] || {};
           pool.query(
-            `INSERT INTO attempts (user_id, source, topic_id, difficulty, question_text, student_answer, correct, mistake_tag)
-             VALUES ($1, 'question_bank', $2, $3, $4, $5, $6, $7)`,
-            [req.user.userId, topicId, (q && q.difficulty) || null, qText, answers[i], !!r.correct, r.correct ? null : (r.mistake_tag || 'other')]
+            `INSERT INTO attempts (user_id, source, topic_id, difficulty, question_text, student_answer, correct, mistake_tag, assignment_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+            [req.user.userId, attemptSource, topicId, (q && q.difficulty) || null, qText, answers[i], !!r.correct, r.correct ? null : (r.mistake_tag || 'other'), attemptAssignmentId]
           ).catch(err => console.error('Failed to save question bank attempt:', err));
         });
         // Spaced review bookkeeping. When this set was served as a review session
@@ -2266,7 +2748,35 @@ app.post('/api/question-bank/grade', aiGuard, async (req, res) => {
         ? `Solid on ${topic}, but a bit more practice would help before your exam.`
         : `Strong work on ${topic} — you're ready to move on to the next topic.`);
 
-    res.json({ results, score, total: results.length, scorePct, mistakeCounts, recommendedRevision });
+    // Mark the homework submitted. Awaited, not fire-and-forget: if this write fails the
+    // student must NOT be told their homework is in, or it would show as missing on the
+    // teacher's list while they believe they handed it in.
+    let assignmentSaved = false;
+    if (pool && req.user && assignmentId) {
+      const aId = Number(assignmentId);
+      if (Number.isInteger(aId) && aId > 0) {
+        try {
+          const upd = await pool.query(
+            `UPDATE assignment_submissions
+                SET status = 'completed', score = $3, total = $4, submitted_at = NOW()
+              WHERE assignment_id = $1 AND user_id = $2 AND status <> 'completed'
+              RETURNING id`,
+            [aId, req.user.userId, score, results.length]
+          );
+          assignmentSaved = upd.rows.length > 0;
+          if (!assignmentSaved) {
+            console.warn(`Assignment ${aId} submission for user ${req.user.userId} was already completed or missing.`);
+          }
+        } catch (err) {
+          console.error('Failed to record assignment submission:', err);
+        }
+      }
+    }
+
+    res.json({
+      results, score, total: results.length, scorePct, mistakeCounts, recommendedRevision,
+      ...(assignmentId ? { assignmentSaved } : {}),
+    });
   } catch (err) {
     if (err.message === 'groq_timeout') return res.status(504).json({ error: 'The AI service took too long to respond. Please try again in a moment.' });
     if (err.message === 'groq_error') {
@@ -2317,7 +2827,7 @@ app.post('/api/diagnostic/start', aiGuard, async (req, res) => {
     if (!tags.length) return res.status(200).json({ topic: topicTitle, questions: [] });
 
     const userMessage = `Topic: ${topicTitle} (grade: ${grade})\nMistake types to probe (write exactly one question per type, in this order):\n${tags.map(t => '- ' + t).join('\n')}`;
-    const text = await callGroq(withLanguage(DIAGNOSTIC_START_SYSTEM_PROMPT, lang), userMessage, 900);
+    const text = await callGroq(withLanguage(DIAGNOSTIC_START_SYSTEM_PROMPT, lang), userMessage, 2000);
     let questions;
     try {
       questions = extractJson(text);
@@ -2356,13 +2866,21 @@ app.post('/api/diagnostic/grade', aiGuard, async (req, res) => {
     }).join('\n\n');
     const userMessage = `Topic: ${topicTitle} (grade: ${grade})\n\n${pairs}`;
 
-    const text = await callGroq(withLanguage(DIAGNOSTIC_GRADE_SYSTEM_PROMPT, lang), userMessage, 700);
+    const text = await callGroq(withLanguage(DIAGNOSTIC_GRADE_SYSTEM_PROMPT, lang), userMessage, 1600);
     let results;
     try {
       results = extractJson(text);
     } catch (e) {
-      console.error('Failed to parse diagnostic grading JSON:', text);
-      return res.status(502).json({ error: 'Could not grade the diagnostic quiz. Try again.' });
+      console.error('Failed to parse diagnostic grading JSON:', e.message, '\nRAW:', text);
+      return res.status(502).json({ error: 'Could not grade the diagnostic quiz. Please try again.' });
+    }
+    // One verdict per question, or nothing. A short/garbled array used to fall through to
+    // `results[i] || {}`, which marked every unanswered-for question as WRONG — writing
+    // misconceptions the student never demonstrated into their profile, and from there into
+    // the study plan and the teacher dashboard.
+    if (results.length !== questions.length || !results.every(r => r && typeof r.correct === 'boolean')) {
+      console.error(`Diagnostic grading incomplete: ${results.length} result(s) for ${questions.length} question(s).`);
+      return res.status(502).json({ error: 'Grading came back incomplete. Please try the quiz again.' });
     }
 
     const strengths = [];
@@ -2493,14 +3011,17 @@ app.post('/api/formula/explain', aiGuard, async (req, res) => {
 
   try {
     const userMessage = `Grade/branch: ${grade}\nTopic: ${topic}\nFormula: ${formula}\n\n${styleGroundingFor(grade)}`;
-    const text = await callGroq(withLanguage(FORMULA_EXPLAIN_SYSTEM_PROMPT, lang), userMessage, 700);
-    const match = text.match(/\{[\s\S]*\}/);
+    // 700 tokens was sized for the original short explanation. This response now carries a
+    // symbols list, units, when-to-use, a worked example AND a practice question with its
+    // answer — all written in full Lebanese exam style since the grounding block was added.
+    // At 700 it was being cut off mid-sentence, which the old parser treated as total failure.
+    const text = await callGroq(withLanguage(FORMULA_EXPLAIN_SYSTEM_PROMPT, lang), userMessage, 1800);
     let explanation;
     try {
-      explanation = JSON.parse(match ? match[0] : text);
+      explanation = extractJsonObject(text);
     } catch (e) {
-      console.error('Failed to parse formula explanation JSON:', text);
-      return res.status(502).json({ error: 'Could not explain this formula. Try again.' });
+      console.error(`Failed to parse formula explanation (grade=${grade}, formula="${formula}", len=${text.length}):`, e.message, '\nRAW:', text);
+      return res.status(502).json({ error: 'The explanation came back unreadable. Please try again.' });
     }
     res.json({ explanation });
   } catch (err) {
@@ -2566,14 +3087,15 @@ app.post('/api/lab-attempt', aiGuard, async (req, res) => {
   const userMessage = `Topic: ${topic}\nQuestion: ${question}\nAllowed mistake tags if incorrect: ${allowedTags.join(', ')}\nStudent's answer: ${answer}`;
 
   try {
-    const text = await callGroq(withLanguage(LAB_GRADE_SYSTEM_PROMPT, lang), userMessage, 300);
-    const match = text.match(/\{[\s\S]*\}/);
+    // 300 tokens is tight for a verdict plus written feedback, so truncation is likely here —
+    // this was the last call site still using the old fragile parser.
+    const text = await callGroq(withLanguage(LAB_GRADE_SYSTEM_PROMPT, lang), userMessage, 600);
     let result;
     try {
-      result = JSON.parse(match ? match[0] : text);
+      result = extractJsonObject(text);
     } catch (e) {
-      console.error('Failed to parse lab grading JSON:', text);
-      return res.status(502).json({ error: 'Could not grade this answer. Try again.' });
+      console.error('Failed to parse lab grading JSON:', e.message, '\nRAW:', text);
+      return res.status(502).json({ error: 'Could not grade this answer. Please try again.' });
     }
 
     if (pool) {
@@ -2837,6 +3359,190 @@ app.get('/api/teacher/topic/:grade/:topicId', requireAuth, requireAdmin, async (
   } catch (err) {
     console.error('Teacher topic-view error:', err);
     res.status(500).json({ error: 'Could not load topic data.' });
+  }
+});
+
+// GET /api/topics/:grade — the full curriculum topic list for a grade.
+// The teacher dashboard needs every topic to choose from when setting homework, not just the
+// ones that already have attempt data (which is all the class view returns). Serving it from
+// here avoids pulling the 280KB curriculum.js into the dashboard just for a list of titles.
+app.get('/api/topics/:grade', requireAuth, (req, res) => {
+  const { grade } = req.params;
+  if (!CURRICULUM[grade]) return res.status(400).json({ error: 'Unknown grade.' });
+  res.json({ grade, topics: CURRICULUM[grade] });
+});
+
+// --- Homework assignments (teacher side) ---
+
+// POST /api/teacher/assignments — set work for a grade.
+app.post('/api/teacher/assignments', requireAuth, requireAdmin, async (req, res) => {
+  if (!pool) return res.status(500).json({ error: 'No database connected on the server yet.' });
+  const { grade, topic, title, instructions, questionCount, difficulty, dueAt } = req.body;
+
+  if (!grade || !CURRICULUM[grade]) return res.status(400).json({ error: 'Please choose a valid grade.' });
+  if (typeof topic !== 'string' || !CURRICULUM[grade].includes(topic)) {
+    return res.status(400).json({ error: 'Please choose a topic from this grade.' });
+  }
+  if (typeof title !== 'string' || !title.trim()) return res.status(400).json({ error: 'Please give the assignment a title.' });
+  if (title.length > 140) return res.status(400).json({ error: 'That title is too long.' });
+  if (instructions && typeof instructions !== 'string') return res.status(400).json({ error: 'Instructions must be text.' });
+
+  const count = Math.min(15, Math.max(3, Number(questionCount) || 6));
+  const diff = QUESTION_BANK_DIFFICULTIES.includes(difficulty) ? difficulty : 'medium';
+
+  // Accept a plain date ("2026-09-14") or a full timestamp; reject anything unparseable rather
+  // than storing a silent null that would make the assignment look like it has no deadline.
+  let due = null;
+  if (dueAt) {
+    const parsed = new Date(dueAt);
+    if (isNaN(parsed.getTime())) return res.status(400).json({ error: 'That due date is not valid.' });
+    due = parsed.toISOString();
+  }
+
+  try {
+    const topicId = await resolveTopicId(grade, topic);
+    if (!topicId) return res.status(400).json({ error: 'Could not find that topic. Try another one.' });
+
+    const result = await pool.query(
+      `INSERT INTO assignments (teacher_id, grade, topic_id, title, instructions, question_count, difficulty, due_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING id, grade, title, instructions, question_count, difficulty, due_at, created_at`,
+      [req.user.userId, grade, topicId, title.trim(), (instructions || '').trim() || null, count, diff, due]
+    );
+    res.json({ assignment: { ...result.rows[0], topic } });
+  } catch (err) {
+    console.error('Create assignment error:', err);
+    res.status(500).json({ error: 'Could not create the assignment.' });
+  }
+});
+
+// GET /api/teacher/assignments?grade=g9 — every assignment with its completion counts.
+// The class size is "students in this grade, excluding demo accounts", so "8 / 21 done" means
+// something real at a glance.
+app.get('/api/teacher/assignments', requireAuth, requireAdmin, async (req, res) => {
+  if (!pool) return res.status(500).json({ error: 'No database connected on the server yet.' });
+  const { grade } = req.query;
+  if (grade && !CURRICULUM[grade]) return res.status(400).json({ error: 'Unknown grade.' });
+
+  try {
+    const result = await pool.query(
+      `SELECT a.id, a.grade, a.title, a.instructions, a.question_count, a.difficulty,
+              a.due_at, a.archived, a.created_at, t.title AS topic,
+              (SELECT COUNT(*) FROM users u
+                WHERE u.grade = a.grade AND COALESCE(u.is_demo, false) = false)::int AS class_size,
+              (SELECT COUNT(*) FROM assignment_submissions s
+                WHERE s.assignment_id = a.id AND s.status = 'completed')::int AS completed_count,
+              (SELECT COUNT(*) FROM assignment_submissions s
+                WHERE s.assignment_id = a.id AND s.status = 'in_progress')::int AS started_count,
+              (SELECT ROUND(AVG(s.score::numeric / NULLIF(s.total, 0)) * 100, 1)
+                 FROM assignment_submissions s
+                WHERE s.assignment_id = a.id AND s.status = 'completed') AS avg_pct
+         FROM assignments a
+         JOIN topics t ON t.id = a.topic_id
+        WHERE a.archived = false ${grade ? 'AND a.grade = $1' : ''}
+        ORDER BY a.created_at DESC
+        LIMIT 50`,
+      grade ? [grade] : []
+    );
+    res.json({ assignments: result.rows });
+  } catch (err) {
+    console.error('List assignments error:', err);
+    res.status(500).json({ error: 'Could not load assignments.' });
+  }
+});
+
+// GET /api/teacher/assignments/:id — who has done it, what they scored, and what the class as a
+// whole got wrong on it. The mistake breakdown is the point: it turns one homework into a
+// answer to "what do I need to reteach on Monday?".
+app.get('/api/teacher/assignments/:id', requireAuth, requireAdmin, async (req, res) => {
+  if (!pool) return res.status(500).json({ error: 'No database connected on the server yet.' });
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid assignment id.' });
+
+  try {
+    const meta = await pool.query(
+      `SELECT a.id, a.grade, a.title, a.instructions, a.question_count, a.difficulty,
+              a.due_at, a.archived, a.created_at, a.topic_id, t.title AS topic
+         FROM assignments a JOIN topics t ON t.id = a.topic_id
+        WHERE a.id = $1`,
+      [id]
+    );
+    if (!meta.rows.length) return res.status(404).json({ error: 'Assignment not found.' });
+    const assignment = meta.rows[0];
+
+    // Every student in the grade, whether or not they've started — the ones who haven't are
+    // exactly who the teacher is looking for.
+    const [students, mistakes] = await Promise.all([
+      pool.query(
+        `SELECT u.id, u.name,
+                COALESCE(s.status, 'not_started') AS status,
+                s.score, s.total, s.submitted_at
+           FROM users u
+           LEFT JOIN assignment_submissions s ON s.user_id = u.id AND s.assignment_id = $1
+          WHERE u.grade = $2 AND COALESCE(u.is_demo, false) = false
+          ORDER BY (COALESCE(s.status, 'not_started') = 'completed'), u.name`,
+        [id, assignment.grade]
+      ),
+      // Scoped by assignment_id, so a later assignment on the same topic can't leak into this
+      // one's numbers.
+      pool.query(
+        `SELECT a.mistake_tag, COUNT(*)::int AS cnt
+           FROM attempts a
+           JOIN users u ON u.id = a.user_id
+          WHERE a.assignment_id = $1
+            AND a.correct = false AND a.mistake_tag IS NOT NULL
+            AND COALESCE(u.is_demo, false) = false
+          GROUP BY a.mistake_tag ORDER BY cnt DESC LIMIT 6`,
+        [id]
+      ),
+    ]);
+
+    res.json({
+      assignment,
+      students: students.rows,
+      commonMistakes: mistakes.rows.map(r => ({ tag: shortTagLabel(r.mistake_tag), count: r.cnt })),
+    });
+  } catch (err) {
+    console.error('Assignment detail error:', err);
+    res.status(500).json({ error: 'Could not load this assignment.' });
+  }
+});
+
+// PATCH /api/teacher/assignments/:id — extend the deadline, or archive it (soft delete, so the
+// submissions and their attempt history stay intact).
+app.patch('/api/teacher/assignments/:id', requireAuth, requireAdmin, async (req, res) => {
+  if (!pool) return res.status(500).json({ error: 'No database connected on the server yet.' });
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid assignment id.' });
+  const { dueAt, archived } = req.body;
+
+  const sets = [], params = [];
+  if (dueAt !== undefined) {
+    if (dueAt === null) { sets.push(`due_at = NULL`); }
+    else {
+      const parsed = new Date(dueAt);
+      if (isNaN(parsed.getTime())) return res.status(400).json({ error: 'That due date is not valid.' });
+      params.push(parsed.toISOString());
+      sets.push(`due_at = $${params.length}`);
+    }
+  }
+  if (archived !== undefined) {
+    params.push(!!archived);
+    sets.push(`archived = $${params.length}`);
+  }
+  if (!sets.length) return res.status(400).json({ error: 'Nothing to update.' });
+
+  params.push(id);
+  try {
+    const result = await pool.query(
+      `UPDATE assignments SET ${sets.join(', ')} WHERE id = $${params.length} RETURNING id, title, due_at, archived`,
+      params
+    );
+    if (!result.rows.length) return res.status(404).json({ error: 'Assignment not found.' });
+    res.json({ assignment: result.rows[0] });
+  } catch (err) {
+    console.error('Update assignment error:', err);
+    res.status(500).json({ error: 'Could not update this assignment.' });
   }
 });
 
