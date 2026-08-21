@@ -162,33 +162,44 @@ const authLimiter = makeRateLimiter({
 // generous — a student doing a full exam plus a long solver session lands nowhere near it —
 // so in practice it only ever trips on automated abuse.
 //
-// Held in memory, so it resets if Render restarts the instance. That's an accepted trade-off:
-// the real protection is that these routes now require a login at all, and the teacher can see
-// and remove accounts from the admin panel. A restart-proof version would need a Redis or a
-// counter table, which isn't worth the write-per-request at this scale.
+// Counted in the DATABASE, not in memory. Two reasons that matters:
+//   1. Render restarts free instances often. An in-memory counter reset the limit every time,
+//      so the cap was largely decorative.
+//   2. It doubles as the only record of what the AI actually costs. Every call the site makes
+//      draws on a shared free quota; without a count there is no way to answer "can this
+//      survive a whole class?" until the day it stops working for everyone at once.
+// One tiny indexed upsert per AI call, immediately before a request that takes several
+// seconds — the added latency is not measurable.
 const AI_DAILY_LIMIT = Number(process.env.AI_DAILY_LIMIT || 120);
-const aiUsage = new Map(); // `${userId}:${YYYY-MM-DD}` -> count
 
-setInterval(() => {
-  // Drop counters for any day other than today; the key encodes the date.
-  const today = new Date().toISOString().slice(0, 10);
-  for (const key of aiUsage.keys()) {
-    if (!key.endsWith(today)) aiUsage.delete(key);
-  }
-}, 60 * 60 * 1000).unref();
-
-function aiQuota(req, res, next){
+async function aiQuota(req, res, next){
   if (!req.user) return next(); // requireAuth runs first and will already have rejected this
-  const key = `${req.user.userId}:${new Date().toISOString().slice(0, 10)}`;
-  const used = (aiUsage.get(key) || 0) + 1;
-  aiUsage.set(key, used);
-  if (used > AI_DAILY_LIMIT) {
-    console.warn(`AI daily limit reached by user ${req.user.userId} (${req.user.email}) — ${used} calls.`);
-    return res.status(429).json({
-      error: "You've reached today's limit for AI help. It resets tomorrow — if you need more, message your teacher."
-    });
+  if (!pool) return next();     // never block practice just because counting isn't available
+  try {
+    // LEAST(..., limit + 1) stops the counter climbing once the cap is passed. Without it, a
+    // student mashing a blocked button kept incrementing on every rejected request, and those
+    // phantom calls went straight into the admin usage panel — the one screen whose entire job
+    // is to give a trustworthy number for quota planning.
+    const result = await pool.query(
+      `INSERT INTO ai_usage (user_id, day, calls) VALUES ($1, CURRENT_DATE, 1)
+       ON CONFLICT (user_id, day)
+       DO UPDATE SET calls = LEAST(ai_usage.calls + 1, $2::int + 1)
+       RETURNING calls`,
+      [req.user.userId, AI_DAILY_LIMIT]
+    );
+    const used = result.rows[0] ? result.rows[0].calls : 0;
+    if (used > AI_DAILY_LIMIT) {
+      console.warn(`AI daily limit reached by user ${req.user.userId} (${req.user.email}) — ${used} calls today.`);
+      return res.status(429).json({
+        error: "You've reached today's limit for AI help. It resets tomorrow — if you need more, message your teacher."
+      });
+    }
+    next();
+  } catch (err) {
+    // Counting is bookkeeping, not a gate. If it fails, let the student work.
+    console.error('AI usage counting failed (allowing the request):', err.message);
+    next();
   }
-  next();
 }
 
 // Convenience: the full middleware chain every AI endpoint should use.
@@ -219,6 +230,23 @@ if (pool) {
   });
 }
 
+// Runs one migration statement, isolating its failure from every other statement.
+//
+// These are all `IF NOT EXISTS`-style, additive and independent, so if one cannot be applied
+// the right response is to log it and carry on — not to abandon the remaining migrations (and
+// certainly not to take the server down). `migrate` is used for the additive/optional
+// statements; the handful of statements that everything else depends on are still awaited
+// directly so a genuinely broken database is obvious in the logs.
+async function migrate(label, sql, params){
+  try {
+    await pool.query(sql, params);
+    return true;
+  } catch (err) {
+    console.error(`Migration step failed (continuing): ${label} — ${err.message}`);
+    return false;
+  }
+}
+
 async function setupDatabase(){
   if (!pool) {
     console.warn('No DATABASE_URL set — accounts and history will not work until a database is connected.');
@@ -236,19 +264,19 @@ async function setupDatabase(){
   // Additive migration: every account is locked to one grade at signup (a student picks
   // their real grade once and can't switch freely — see the register endpoint below).
   // Nullable so accounts created before this existed (and the admin account) don't break.
-  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS grade TEXT;`);
+  await migrate('users.grade', `ALTER TABLE users ADD COLUMN IF NOT EXISTS grade TEXT;`);
   // Additive migration: lets the teacher mark an account as a demo/test account (e.g. to
   // show the site to someone) without it ever showing up in class analytics, the weekly
   // digest, the teacher dashboard, or the "what to teach next" recommendation — every one of
   // those aggregate queries excludes users flagged here. Defaults to false so every existing
   // real student is unaffected.
-  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_demo BOOLEAN DEFAULT false;`);
+  await migrate('users.is_demo', `ALTER TABLE users ADD COLUMN IF NOT EXISTS is_demo BOOLEAN DEFAULT false;`);
   // Additive migration: real role stored on the account instead of inferring "is this the
   // teacher?" from a matching email address. The old email-based check was fragile — email is
   // never verified at signup, so if ADMIN_EMAIL ever pointed at an address with no account
   // yet, a student could register it and inherit admin access. It also could not be revoked,
   // because the email was baked into a 30-day token.
-  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'student';`);
+  await migrate('users.role', `ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'student';`);
   // Promote the configured admin email once, if that account exists. Safe to re-run.
   if (process.env.ADMIN_EMAIL) {
     const promoted = await pool.query(
@@ -258,12 +286,12 @@ async function setupDatabase(){
     if (promoted.rows.length) console.log(`Promoted ${process.env.ADMIN_EMAIL} to role=teacher.`);
   }
   // Additive migration: optional parent contact, used for the monthly progress report.
-  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS parent_email TEXT;`);
+  await migrate('users.parent_email', `ALTER TABLE users ADD COLUMN IF NOT EXISTS parent_email TEXT;`);
   // Additive migration: lets us invalidate tokens issued before a password change. Without it,
   // resetting a student's password did not actually cut off anyone already holding their old
   // 30-day token. Defaults to NULL, which means "no reset has happened" — existing tokens for
   // accounts that never reset stay valid, so nobody is logged out by this upgrade.
-  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMP;`);
+  await migrate('users.password_changed_at', `ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMP;`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS exam_results (
       id SERIAL PRIMARY KEY,
@@ -330,20 +358,20 @@ async function setupDatabase(){
       created_at TIMESTAMP DEFAULT NOW()
     );
   `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_attempts_user_topic ON attempts (user_id, topic_id);`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_attempts_topic ON attempts (topic_id);`);
+  await migrate('idx_attempts_user_topic', `CREATE INDEX IF NOT EXISTS idx_attempts_user_topic ON attempts (user_id, topic_id);`);
+  await migrate('idx_attempts_topic', `CREATE INDEX IF NOT EXISTS idx_attempts_topic ON attempts (topic_id);`);
   // Used by the weekly digest and every "recent activity" window. This index used to be
   // created at module load time, outside this function — on a fresh database that ran before
   // the `attempts` table existed, and the failure was swallowed by an empty .catch().
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_attempts_created_at ON attempts (created_at);`);
+  await migrate('idx_attempts_created_at', `CREATE INDEX IF NOT EXISTS idx_attempts_created_at ON attempts (created_at);`);
   // Supports the per-student mistake lookup that now feeds question/exam generation.
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_attempts_user_correct ON attempts (user_id, correct);`);
+  await migrate('idx_attempts_user_correct', `CREATE INDEX IF NOT EXISTS idx_attempts_user_correct ON attempts (user_id, correct);`);
 
   // Every /api/my/* page and the per-user counts on the admin users list filter by user_id.
   // Without these, each one is a sequential scan over the whole table.
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_exam_results_user ON exam_results (user_id);`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_study_plans_user ON study_plans (user_id);`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_solver_history_user ON solver_history (user_id);`);
+  await migrate('idx_exam_results_user', `CREATE INDEX IF NOT EXISTS idx_exam_results_user ON exam_results (user_id);`);
+  await migrate('idx_study_plans_user', `CREATE INDEX IF NOT EXISTS idx_study_plans_user ON study_plans (user_id);`);
+  await migrate('idx_solver_history_user', `CREATE INDEX IF NOT EXISTS idx_solver_history_user ON solver_history (user_id);`);
 
   // Teacher Intervention Log — lets a teacher note "I taught/reviewed X" so the dashboard
   // can later show before/after mastery around that moment. topic_id is nullable: an
@@ -359,8 +387,8 @@ async function setupDatabase(){
       created_at TIMESTAMP DEFAULT NOW()
     );
   `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_interventions_grade ON interventions (grade);`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_interventions_topic ON interventions (topic_id);`);
+  await migrate('idx_interventions_grade', `CREATE INDEX IF NOT EXISTS idx_interventions_grade ON interventions (grade);`);
+  await migrate('idx_interventions_topic', `CREATE INDEX IF NOT EXISTS idx_interventions_topic ON interventions (topic_id);`);
 
   // Booking — a student requests a session (grade/topic/private-or-group/duration/preferred
   // time), the teacher confirms or cancels it from the admin side. status starts 'pending'
@@ -381,8 +409,8 @@ async function setupDatabase(){
       created_at TIMESTAMP DEFAULT NOW()
     );
   `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_bookings_user ON bookings (user_id);`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_bookings_status ON bookings (status);`);
+  await migrate('idx_bookings_user', `CREATE INDEX IF NOT EXISTS idx_bookings_user ON bookings (user_id);`);
+  await migrate('idx_bookings_status', `CREATE INDEX IF NOT EXISTS idx_bookings_status ON bookings (status);`);
 
   // --- Spaced review queue ---
   // Getting a question wrong once and never seeing it again is the biggest thing the app was
@@ -411,7 +439,7 @@ async function setupDatabase(){
       UNIQUE (user_id, topic_id, mistake_tag)
     );
   `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_review_due ON review_queue (user_id, retired, due_at);`);
+  await migrate('idx_review_due', `CREATE INDEX IF NOT EXISTS idx_review_due ON review_queue (user_id, retired, due_at);`);
 
   // --- Homework assignments ---
   // The teacher sets work for a whole grade; each student gets their OWN generated question set
@@ -436,7 +464,7 @@ async function setupDatabase(){
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
   `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_assignments_grade ON assignments (grade, archived, due_at);`);
+  await migrate('idx_assignments_grade', `CREATE INDEX IF NOT EXISTS idx_assignments_grade ON assignments (grade, archived, due_at);`);
 
   // One row per student per assignment. Created when the student opens it (status
   // 'in_progress', questions stored so a refresh doesn't reshuffle their paper) and completed
@@ -455,14 +483,42 @@ async function setupDatabase(){
       UNIQUE (assignment_id, user_id)
     );
   `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_submissions_assignment ON assignment_submissions (assignment_id);`);
+  await migrate('idx_submissions_assignment', `CREATE INDEX IF NOT EXISTS idx_submissions_assignment ON assignment_submissions (assignment_id);`);
   // Ties an attempt to the exact homework it came from. Without it, the teacher's "what did the
   // class get wrong" panel had to guess by (topic + created after the assignment), which meant
   // a second assignment on the same topic later in the year got folded into the first one's
   // breakdown — permanently over-reporting it.
-  await pool.query(`ALTER TABLE attempts ADD COLUMN IF NOT EXISTS assignment_id INTEGER REFERENCES assignments(id) ON DELETE SET NULL;`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_attempts_assignment ON attempts (assignment_id);`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_submissions_user ON assignment_submissions (user_id, status);`);
+  await migrate('attempts.assignment_id', `ALTER TABLE attempts ADD COLUMN IF NOT EXISTS assignment_id INTEGER REFERENCES assignments(id) ON DELETE SET NULL;`);
+  await migrate('idx_attempts_assignment', `CREATE INDEX IF NOT EXISTS idx_attempts_assignment ON attempts (assignment_id);`);
+  await migrate('idx_submissions_user', `CREATE INDEX IF NOT EXISTS idx_submissions_user ON assignment_submissions (user_id, status);`);
+
+  // --- Method-first answering ---
+  // Did the student reach for the RIGHT physics, regardless of whether the final number came
+  // out right? NULL means this question never asked for a method.
+  //
+  // This is the most useful column in the table for teaching. "Used the wrong law" and "used
+  // the right law but slipped in the arithmetic" produce an identical score, need completely
+  // different lessons, and until now were indistinguishable in the data.
+  // One row per student per day. Backs the daily cap AND answers "what is this costing me?"
+  // before the free quota runs out mid-lesson.
+  // Uses migrate() like its neighbours: a bare pool.query here would reject the whole
+  // setupDatabase() promise on failure, skipping every migration after it — including the
+  // attempts columns below, after which every attempt INSERT would fail silently into a
+  // .catch while students carried on seeing normal scores.
+  await migrate('ai_usage table', `
+    CREATE TABLE IF NOT EXISTS ai_usage (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      day DATE NOT NULL,
+      calls INTEGER NOT NULL DEFAULT 0,
+      UNIQUE (user_id, day)
+    );
+  `);
+  await migrate('idx_ai_usage_day', `CREATE INDEX IF NOT EXISTS idx_ai_usage_day ON ai_usage (day);`);
+
+  await migrate('attempts.method_correct', `ALTER TABLE attempts ADD COLUMN IF NOT EXISTS method_correct BOOLEAN;`);
+  await migrate('attempts.stated_method', `ALTER TABLE attempts ADD COLUMN IF NOT EXISTS stated_method TEXT;`);
+  await migrate('idx_attempts_method', `CREATE INDEX IF NOT EXISTS idx_attempts_method ON attempts (user_id, method_correct);`);
 
   // Seed `topics` from the CURRICULUM in topics.js — safe to re-run, ON CONFLICT skips
   // anything already there. Keeps the canonical topic list in one place server-side.
@@ -494,12 +550,17 @@ async function resolveTopicId(grade, title){
     return null;
   }
 }
-// A failed setup used to be logged and then ignored, leaving the app serving requests against
-// a database with missing tables/columns — every route would fail in a confusing way. Exiting
-// makes the problem obvious in the Render logs and keeps the last good deploy live.
+// Startup migrations run in the background and must NEVER take the site down.
+//
+// An earlier version of this exited the process when setupDatabase() rejected. That was the
+// wrong trade: a single failing ALTER — an index that couldn't be built, a column added by a
+// newer deploy, a transient connection drop during startup — killed the whole server, so
+// students couldn't even log in over a migration that had nothing to do with logging in.
+// Logging loudly and continuing is far safer: the routes that depend on a missing column fail
+// individually and visibly, while everything else keeps working.
 setupDatabase().catch(err => {
-  console.error('FATAL: database setup failed:', err);
-  process.exit(1);
+  console.error('WARNING: database setup did not finish cleanly. The server is still running,');
+  console.error('but any feature relying on a migration that failed may not work:', err);
 });
 
 // --- Auth helpers ---
@@ -1412,6 +1473,75 @@ app.patch('/api/admin/bookings/:id', requireAuth, requireAdmin, async (req, res)
 // the teacher-facing counterpart to the student Dashboard, which only ever shows one student
 // at a time. Every query is grouped by grade — no single-student drill-down here, that's what
 // /api/admin/users is for.
+// GET /api/admin/ai-usage — what the AI is actually being used for, and by whom.
+//
+// The point of this screen is to answer one question before it becomes urgent: "if I put a
+// whole class on this, does the free quota survive?" Both providers cut off silently when their
+// allowance runs out, and it stops working for everyone at once, mid-lesson.
+app.get('/api/admin/ai-usage', requireAuth, requireAdmin, async (req, res) => {
+  if (!pool) return res.status(500).json({ error: 'No database connected on the server yet.' });
+  try {
+    // Every figure below excludes demo accounts, and the per-student average is computed from a
+    // dedicated COUNT — not from the length of the top-30 list, which would peg the divisor at
+    // 30 once the class grew past that and inflate the projection without limit.
+    const [today, month, perStudent, daily, activeCount] = await Promise.all([
+      pool.query(
+        `SELECT COALESCE(SUM(a.calls), 0)::int AS n
+           FROM ai_usage a JOIN users u ON u.id = a.user_id
+          WHERE a.day = CURRENT_DATE AND COALESCE(u.is_demo, false) = false`
+      ),
+      pool.query(
+        `SELECT COALESCE(SUM(a.calls), 0)::int AS n
+           FROM ai_usage a JOIN users u ON u.id = a.user_id
+          WHERE a.day >= CURRENT_DATE - INTERVAL '30 days' AND COALESCE(u.is_demo, false) = false`
+      ),
+      pool.query(
+        `SELECT u.id, u.name, u.grade,
+                COALESCE(SUM(a.calls), 0)::int AS calls_30d,
+                COALESCE(SUM(a.calls) FILTER (WHERE a.day = CURRENT_DATE), 0)::int AS calls_today
+           FROM users u
+           LEFT JOIN ai_usage a ON a.user_id = u.id AND a.day >= CURRENT_DATE - INTERVAL '30 days'
+          WHERE COALESCE(u.is_demo, false) = false
+          GROUP BY u.id, u.name, u.grade
+         HAVING COALESCE(SUM(a.calls), 0) > 0
+          ORDER BY calls_30d DESC
+          LIMIT 30`
+      ),
+      pool.query(
+        `SELECT a.day, SUM(a.calls)::int AS calls
+           FROM ai_usage a JOIN users u ON u.id = a.user_id
+          WHERE a.day >= CURRENT_DATE - INTERVAL '14 days' AND COALESCE(u.is_demo, false) = false
+          GROUP BY a.day ORDER BY a.day ASC`
+      ),
+      // Counts EVERY active student, not just the 30 listed below.
+      pool.query(
+        `SELECT COUNT(DISTINCT a.user_id)::int AS n
+           FROM ai_usage a JOIN users u ON u.id = a.user_id
+          WHERE a.day >= CURRENT_DATE - INTERVAL '30 days' AND COALESCE(u.is_demo, false) = false`
+      ),
+    ]);
+
+    const students = perStudent.rows;          // top 30, for the table
+    const activeStudents = activeCount.rows[0].n;  // all of them, for the maths
+    const monthTotal = month.rows[0].n;
+    // The number that actually matters for planning: what one student costs per month.
+    const perStudentPerMonth = activeStudents ? Math.round((monthTotal / activeStudents) * 10) / 10 : 0;
+
+    res.json({
+      today: today.rows[0].n,
+      last30Days: monthTotal,
+      activeStudents,
+      perStudentPerMonth,
+      dailyLimit: AI_DAILY_LIMIT,
+      students,
+      daily: daily.rows,
+    });
+  } catch (err) {
+    console.error('AI usage error:', err);
+    res.status(500).json({ error: 'Could not load AI usage.' });
+  }
+});
+
 app.get('/api/admin/analytics', requireAuth, requireAdmin, async (req, res) => {
   if (!pool) return res.status(500).json({ error: 'No database connected on the server yet.' });
   try {
@@ -1685,11 +1815,31 @@ async function callGemini(systemPrompt, userText, image){
 }
 
 // If the site is set to French, tell the AI to answer in French.
+// Pins the output language explicitly, in BOTH directions.
+//
+// This used to add an instruction only for French and nothing at all otherwise, on the
+// assumption that the model would default to English. It does not — and the prompts around it
+// pull hard the other way: the exam prompts are steeped in "Lebanese Baccalaureate/Brevet"
+// framing, and two Grade 9 topic names literally carry their French originals ("DC Voltage
+// (Tension continue)", "Resistors (Conducteurs ohmiques)"). With no instruction to the
+// contrary the model reads all that as a French-language context and writes the whole exam in
+// French, for a student who set the site to English.
+//
+// So English is now stated as deliberately as French is. Never rely on a default.
 function withLanguage(prompt, lang){
   if (lang === 'fr') {
-    return prompt + '\n\nIMPORTANT: Respond entirely in French, including all explanations, headings, and labels.';
+    return prompt + `
+
+LANGUAGE — this overrides any language cue elsewhere in this prompt:
+Write your ENTIRE response in French: every question, explanation, heading, label and piece of feedback.
+Physics symbols and units stay standard (U, I, R, m/s²), but all prose is French.`;
   }
-  return prompt;
+  return prompt + `
+
+LANGUAGE — this overrides any language cue elsewhere in this prompt:
+Write your ENTIRE response in ENGLISH: every question, explanation, heading, label and piece of feedback.
+This matters because the surrounding context is Lebanese and may mention French curriculum terms, French topic names, or the Baccalaureate — none of that changes the output language. Even where a topic name is given with its French original in brackets, write in English and use the English name.
+Physics symbols and units stay standard (U, I, R, m/s²). Do not mix languages, and do not add French translations in brackets.`;
 }
 
 // This tool is used for homework help, so the #1 rule is: NEVER hand the student the finished
@@ -1705,10 +1855,12 @@ When given a physics problem (as text, or shown in a photo), break the solution 
 
 If a photo of the student's OWN attempt is included alongside the problem, also include a top-level "feedback" string: briefly and gently note whether their attempt was on the right track and, if not, which step number they went wrong at — do not restate the full solution inside it, just point them back toward the right step. If no student attempt was included, set "feedback" to null.
 
+The message may also contain a line beginning "The student's own first move:" — what they said they would try BEFORE any help appeared, written without seeing your steps. When that line is present, include a top-level "attemptResponse" string answering it directly: say whether that opening move was the right one. If it was, say so plainly before the steps begin ("Yes — energy conservation is exactly the right tool here"). If it wasn't, name what they reached for, say why it doesn't fit this problem, and point at what does — without solving it for them. Two or three sentences, addressed to the student as "you". Choosing the right first move is a real success and should be named as one; choosing the wrong one is the most useful thing they can learn from this problem. If there is no such line, set "attemptResponse" to null.
+
 Keep language clear, concise, and appropriate for a high school student.
 
 Respond with ONLY a single JSON object, nothing else — no markdown fences, no preamble, no text outside the JSON. Format:
-{"steps": [{"hint": "...", "detail": "..."}, {"hint": "...", "detail": "..."}], "feedback": null}`;
+{"steps": [{"hint": "...", "detail": "..."}, {"hint": "...", "detail": "..."}], "feedback": null, "attemptResponse": null}`;
 
 // --- Solver topic classification ---
 // The solver UI doesn't ask the student which topic/grade a problem is (that would add
@@ -1734,7 +1886,7 @@ async function classifySolverTopic(problemText, solutionText, knownGrade){
   if (!process.env.GROQ_API_KEY) return null;
   try {
     const userMessage = `Curriculum:\n${curriculumReference(knownGrade)}\n\n${knownGrade ? `Grade: ${knownGrade}\n` : ''}Problem: ${problemText || '(submitted as a photo, see solution for context)'}\nSolution: ${solutionText}`;
-    const text = await callGroq(CLASSIFY_SYSTEM_PROMPT, userMessage, 100);
+    const text = await callGroq(withLanguage(CLASSIFY_SYSTEM_PROMPT, 'en'), userMessage, 100);
     const parsed = extractJsonObject(text);
     if (!parsed || !parsed.grade || !parsed.topic) return null;
     return { grade: parsed.grade, topic: parsed.topic };
@@ -1801,7 +1953,11 @@ app.post('/api/solve', aiGuard, async (req, res) => {
   // `grade` is optional and not sent by the UI today — if present (future UI change) it
   // narrows classification to that grade's topic list; if absent, classification searches
   // the whole curriculum and also guesses the grade.
-  const { problem, image, lang, grade } = req.body;
+  // `firstStep` is what the student said they would try before any help was shown. It turns the
+  // solver from something that explains at them into something that answers their actual
+  // thinking — "yes, energy conservation is the right tool" or "you reached for kinematics, but
+  // the acceleration isn't constant here".
+  const { problem, image, lang, grade, firstStep } = req.body;
 
   if ((!problem || typeof problem !== 'string' || !problem.trim()) && !image) {
     return res.status(400).json({ error: 'Please send a physics problem in the "problem" field, or attach an image.' });
@@ -1812,7 +1968,13 @@ app.post('/api/solve', aiGuard, async (req, res) => {
   }
 
   try {
-    const raw = await callGemini(withLanguage(SYSTEM_PROMPT, lang), problem, image);
+    const attempt = typeof firstStep === 'string' && firstStep.trim()
+      ? firstStep.trim().slice(0, 600)
+      : '';
+    const userText = attempt
+      ? `${problem || ''}\n\nThe student's own first move: ${attempt}`
+      : problem;
+    const raw = await callGemini(withLanguage(SYSTEM_PROMPT, lang), userText, image);
 
     let parsed;
     try {
@@ -1829,6 +1991,11 @@ app.post('/api/solve', aiGuard, async (req, res) => {
       return res.status(502).json({ error: 'Could not generate a valid solution. Try again.' });
     }
     const feedback = typeof parsed.feedback === 'string' && parsed.feedback.trim() ? parsed.feedback.trim() : null;
+    // Only surfaced when the student actually stated a first move — never invented for someone
+    // who skipped the prompt.
+    const attemptResponse = attempt && typeof parsed.attemptResponse === 'string' && parsed.attemptResponse.trim()
+      ? parsed.attemptResponse.trim()
+      : null;
 
     // Flatten to plain text for storage/classification. solver_history's `solution` column is
     // never displayed back in a list (/api/my/history only selects id, problem, created_at),
@@ -1857,7 +2024,7 @@ app.post('/api/solve', aiGuard, async (req, res) => {
       }).catch(err => console.error('Solver topic classification failed:', err));
     }
 
-    res.json({ steps, feedback });
+    res.json({ steps, feedback, attemptResponse });
   } catch (err) {
     if (err.message === 'gemini_timeout') return res.status(504).json({ error: 'The AI service took too long to respond. Please try again in a moment.' });
     if (err.message === 'gemini_error') {
@@ -2013,9 +2180,15 @@ const EXAM_GRADE_SYSTEM_PROMPT = `You are a physics teacher grading a Lebanese h
 You will be given a list of questions (each with a type: "tf", "mcq", or "problem"; mcq ones include their choices; each question also lists its topic and, if the topic is a known one, the exact set of allowed mistake tags for that topic) and the student's answers, in the same order.
 For each question, decide if the student's answer is correct — for "tf" and "mcq" compare against the correct option; for "problem" allow reasonable equivalent phrasing/units, don't require exact wording. Write short (1-2 sentence) feedback explaining why, and the correct answer if they got it wrong.
 If the answer is INCORRECT, also pick exactly one "mistake_tag" from that question's allowed list that best describes the kind of error — use "other" only if none of the specific tags fit. If the answer is correct, omit "mistake_tag" (or set it to null).
+
+SOME questions also include a line starting with "Student's stated method:" — this is what the student said they would use BEFORE working out the answer (which law, principle or formula applies). When that line is present you must ALSO judge the method itself:
+- "method_correct": true if the stated law/principle/formula is the right one for this question, even if their final number is wrong. False if they reached for the wrong physics.
+- "method_feedback": one short sentence on the method specifically — if it was wrong, name the correct law/formula and say briefly why it applies here.
+Judge the method on physics, not on wording: "v squared equals 2 g h", "energy conservation" and "mgh = half m v squared" are all the same correct method. Accept a method stated in the student's own words, and accept it in French or Arabic.
+This distinction matters more than the final mark: a student who picked the right law and slipped in the arithmetic needs completely different help from one who reached for the wrong law entirely. When the method is right but the answer is wrong, prefer a mistake_tag describing the execution error (a calculation or unit slip) rather than a conceptual one; when the method itself is wrong, prefer the conceptual tag.
 Respond with ONLY a JSON array of objects, nothing else — no markdown, no preamble. Format:
-[{"correct": true, "feedback": "short explanation"}, {"correct": false, "feedback": "short explanation with the correct answer", "mistake_tag": "one-of-the-allowed-tags"}]
-The array must have exactly as many objects as there are questions, in the same order.`;
+[{"correct": true, "feedback": "short explanation"}, {"correct": false, "feedback": "short explanation with the correct answer", "mistake_tag": "one-of-the-allowed-tags", "method_correct": false, "method_feedback": "short note on the method"}]
+Include "method_correct" and "method_feedback" ONLY for questions that had a stated method. The array must have exactly as many objects as there are questions, in the same order.`;
 
 // Practice Exam grading is now per-problem and vision-based: the student photographs their
 // handwritten work for one whole problem (all its parts together) instead of typing answers,
@@ -2496,6 +2669,18 @@ Deliberately include at least one question that targets the first weak point abo
   }
 }
 
+// --- Worksheet answer key ---
+// For paper lessons: the same generated question set, plus model answers for the teacher.
+// This is the one place in the app where full worked answers are produced on purpose — it is
+// gated behind requireAdmin, so it is only ever the teacher's copy, never a student's.
+const ANSWER_KEY_SYSTEM_PROMPT = `You are a Lebanese physics teacher writing the ANSWER KEY for a worksheet you are about to hand out.
+You will be given a grade, a topic, and a numbered list of questions.
+For each question write the model answer a teacher would put on their own copy: the final answer, and the key steps or reasoning in the way it should be marked. Keep each one tight — a few lines, not a full essay. Use the Lebanese conventions for this grade (g = 10 m/s² or N/kg, U for voltage from Grade 9 up, P = F/S for pressure, SI units throughout).
+Where a question could be marked on method as well as the final number, say briefly what earns the marks.
+Respond with ONLY a JSON array of strings, nothing else — no markdown, no preamble. One string per question, in the same order:
+["Answer to Q1 with the key steps.", "Answer to Q2 ..."]
+The array must have exactly as many strings as there are questions.`;
+
 // One short guiding hint for a student who's stuck on a practice question and hasn't
 // answered yet — same "never give the answer away" philosophy as the Solver, applied here so
 // a stuck student has somewhere to go besides leaving it blank or guessing.
@@ -2589,7 +2774,11 @@ app.post('/api/question-bank/grade', aiGuard, async (req, res) => {
   // duplicating the grading pipeline — the only difference is that the result is also recorded
   // against the assignment, and the attempts are tagged source='assignment' so the teacher's
   // per-assignment mistake breakdown can find them.
-  const { answers, lang, isReview, assignmentId } = req.body;
+  // `methods` is optional and parallel to `answers`: what the student said they would USE to
+  // solve each problem, committed before they were allowed to type a final answer. It is what
+  // separates "doesn't understand the physics" from "understands it but slipped in the
+  // arithmetic" — the distinction the teacher actually needs to know what to reteach.
+  const { answers, methods, lang, isReview, assignmentId } = req.body;
   let { grade, topic, questions } = req.body;
   if (!process.env.GROQ_API_KEY) {
     return res.status(500).json({ error: 'Server is missing its API key. Set GROQ_API_KEY in the environment.' });
@@ -2655,15 +2844,20 @@ app.post('/api/question-bank/grade', aiGuard, async (req, res) => {
   }
 
   try {
+    const statedMethods = Array.isArray(methods) ? methods : [];
     const pairs = questions.map((q, i) => {
       const qText = typeof q === 'string' ? q : q.question;
       const qType = typeof q === 'string' ? 'problem' : (q.type || 'problem');
       const choicesLine = (qType === 'mcq' && Array.isArray(q.choices)) ? `\nChoices: ${q.choices.join(', ')}` : '';
-      return `Q${i + 1} (${qType}): ${qText}${choicesLine}\nAllowed mistake tags if incorrect: ${tagsForTopic(topic).join(', ')}\nStudent's answer: ${answers[i]}`;
+      const m = typeof statedMethods[i] === 'string' ? statedMethods[i].trim() : '';
+      const methodLine = m ? `\nStudent's stated method: ${m}` : '';
+      return `Q${i + 1} (${qType}): ${qText}${choicesLine}\nAllowed mistake tags if incorrect: ${tagsForTopic(topic).join(', ')}${methodLine}\nStudent's answer: ${answers[i]}`;
     }).join('\n\n');
     const userMessage = `Grade/branch: ${grade}\nTopic: ${topic}\n\n${pairs}`;
 
-    const text = await callGroq(withLanguage(EXAM_GRADE_SYSTEM_PROMPT, lang), userMessage, Math.min(3000, 300 + questions.length * 180));
+    // A method judgement adds a sentence per question to the response.
+    const gradeMaxTokens = Math.min(5000, 300 + questions.length * (statedMethods.length ? 260 : 180));
+    const text = await callGroq(withLanguage(EXAM_GRADE_SYSTEM_PROMPT, lang), userMessage, gradeMaxTokens);
     let results;
     try {
       results = extractJson(text);
@@ -2697,6 +2891,38 @@ app.post('/api/question-bank/grade', aiGuard, async (req, res) => {
       }
     });
 
+    // Split the wrong answers into the two kinds that need different teaching. This is the
+    // headline the student sees now instead of a bare score: getting three questions wrong
+    // because of arithmetic is a completely different situation from getting three wrong
+    // because the wrong law was used, and a percentage hides that entirely.
+    // A method verdict only counts when the student ACTUALLY stated a method. The model is told
+    // to emit method_correct only for those questions, but it isn't a contract we can rely on —
+    // and an unprompted verdict would put a "✕ Wrong method" badge on a True/False question the
+    // student was never asked a method for, and write method_correct with stated_method NULL,
+    // which then feeds the teacher's reteach columns as if it were real evidence.
+    const hasStatedMethod = (i) => typeof statedMethods[i] === 'string' && statedMethods[i].trim().length > 0;
+    results.forEach((r, i) => {
+      if (!hasStatedMethod(i)) {
+        // Drop anything the model volunteered here so it can't reach the student or the DB.
+        delete r.method_correct;
+        delete r.method_feedback;
+      }
+    });
+
+    let methodRight = 0, methodWrong = 0, slips = 0;
+    results.forEach((r, i) => {
+      if (typeof r.method_correct !== 'boolean') return;
+      if (r.method_correct) {
+        methodRight++;
+        if (!r.correct) slips++;   // right physics, wrong number
+      } else {
+        methodWrong++;
+      }
+    });
+    const methodSummary = (methodRight + methodWrong) > 0
+      ? { asked: methodRight + methodWrong, methodRight, methodWrong, slips }
+      : null;
+
     // Only tag as homework once the submission row has actually been verified above — otherwise
     // any student could post a made-up assignmentId and inject rows into the teacher's
     // per-assignment mistake breakdown without ever being set that homework.
@@ -2708,10 +2934,15 @@ app.post('/api/question-bank/grade', aiGuard, async (req, res) => {
         questions.forEach((q, i) => {
           const qText = typeof q === 'string' ? q : q.question;
           const r = results[i] || {};
+          const statedMethod = typeof statedMethods[i] === 'string' && statedMethods[i].trim()
+            ? statedMethods[i].trim().slice(0, 500)
+            : null;
           pool.query(
-            `INSERT INTO attempts (user_id, source, topic_id, difficulty, question_text, student_answer, correct, mistake_tag, assignment_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-            [req.user.userId, attemptSource, topicId, (q && q.difficulty) || null, qText, answers[i], !!r.correct, r.correct ? null : (r.mistake_tag || 'other'), attemptAssignmentId]
+            `INSERT INTO attempts (user_id, source, topic_id, difficulty, question_text, student_answer, correct, mistake_tag, assignment_id, method_correct, stated_method)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+            [req.user.userId, attemptSource, topicId, (q && q.difficulty) || null, qText, answers[i],
+             !!r.correct, r.correct ? null : (r.mistake_tag || 'other'), attemptAssignmentId,
+             typeof r.method_correct === 'boolean' ? r.method_correct : null, statedMethod]
           ).catch(err => console.error('Failed to save question bank attempt:', err));
         });
         // Spaced review bookkeeping. When this set was served as a review session
@@ -2775,6 +3006,7 @@ app.post('/api/question-bank/grade', aiGuard, async (req, res) => {
 
     res.json({
       results, score, total: results.length, scorePct, mistakeCounts, recommendedRevision,
+      methodSummary,
       ...(assignmentId ? { assignmentSaved } : {}),
     });
   } catch (err) {
@@ -3605,9 +3837,171 @@ app.get('/api/teacher/interventions/:grade', requireAuth, requireAdmin, async (r
 // per-topic stats (mastery %, mistake-tag distribution) to Groq — never raw student
 // answers or names — so the prompt stays small/cheap and no student-identifiable data
 // leaves the server.
+// --- The weekly reteach list ---
+// The dashboard already shows WHAT the class got wrong. This turns that into what to actually
+// do about it on Monday: for each of the top misconceptions, a short explanation of why
+// students fall into it and a concrete way to address it in a few minutes of class time.
+// Aimed at being usable as-is, not as a starting point that still needs an hour of prep.
+const RETEACH_SYSTEM_PROMPT = `You are an experienced Lebanese physics teacher planning what to reteach.
+You will be given: a grade, and a list of the misconceptions this class actually showed over the past week — each with how many times it occurred, on which topic, and how many separate students showed it. Some entries also report how often students chose the WRONG METHOD (the wrong law/principle) versus getting the method right and slipping in the calculation. That distinction should drive your advice: a wrong-method problem needs the concept retaught, a calculation-slip problem needs practice and care, not reteaching.
+For each misconception, write a short plan the teacher can use in 5 minutes of class time.
+Respond with ONLY a JSON array, nothing else — no markdown, no preamble. At most 3 objects, most important first. Format:
+[{
+  "misconception": "<the misconception, in plain teacher language>",
+  "topic": "<the topic it sits in>",
+  "whyItHappens": "<1-2 sentences on the thinking error behind it — what the student believes that isn't true>",
+  "howToFix": "<2-3 sentences: a concrete 5-minute approach — a specific demonstration, a counter-example, a question to pose to the class, or a contrast to draw. Name real physics, not generic teaching advice.>",
+  "checkQuestion": "<one short question the teacher can ask afterwards to check it landed, written in Lebanese exam phrasing>"
+}]
+Be specific to the physics and to the Lebanese curriculum at this grade. Never give generic advice like "review the basics" or "encourage students to practice more".`;
+
 const TEACH_NEXT_SYSTEM_PROMPT = `You are an experienced physics teacher's assistant. You will be given aggregated class performance stats: for each topic, mastery percentage, number of students struggling, and the most common mistake types.
 Give ONE short, specific, actionable recommendation (2-4 sentences) about what to teach or review next, in the style of: "Before moving to friction, review net force and free-body diagrams. 38% of students are still showing the same misconception."
 Be concrete — name the actual topic and the actual mistake pattern from the data, don't give generic teaching advice. If mastery is broadly high everywhere, say it's fine to move on and suggest the next logical topic.`;
+
+// POST /api/teacher/worksheet — a printable question sheet plus a separate answer key.
+//
+// Teacher-only, deliberately. This is the single route in the app that returns fully worked
+// answers, which is exactly what a student must never be handed — requireAdmin is what keeps
+// the Socratic promise of the rest of the site intact.
+app.post('/api/teacher/worksheet', requireAuth, requireAdmin, aiLimiter, async (req, res) => {
+  if (!pool) return res.status(500).json({ error: 'No database connected on the server yet.' });
+  if (!process.env.GROQ_API_KEY) return res.status(500).json({ error: 'Server is missing its API key. Set GROQ_API_KEY in the environment.' });
+  const { grade, topic, count, difficulty, lang } = req.body;
+
+  if (!grade || !CURRICULUM[grade]) return res.status(400).json({ error: 'Please choose a valid grade.' });
+  if (typeof topic !== 'string' || !CURRICULUM[grade].includes(topic)) {
+    return res.status(400).json({ error: 'Please choose a topic from this grade.' });
+  }
+  const n = Math.min(15, Math.max(3, Number(count) || 8));
+  const diff = QUESTION_BANK_DIFFICULTIES.includes(difficulty) ? difficulty : 'medium';
+
+  try {
+    const grounding = styleGroundingFor(grade);
+    const userMessage = `Grade/branch: ${GRADE_LABELS[grade] || grade}\nTopic: ${topic}\nDifficulty/style: ${diff}\nNumber of questions: ${n}${grounding ? `\n\n${grounding}` : ''}`;
+    const text = await callGroq(withLanguage(QUESTION_BANK_GEN_SYSTEM_PROMPT, lang), userMessage, Math.min(6000, 400 + n * tokensPerQuestion(grade)));
+
+    let questions;
+    try {
+      questions = extractJson(text);
+    } catch (e) {
+      console.error(`Failed to parse worksheet questions (grade=${grade}, topic="${topic}"):`, e.message, '\nRAW:', text);
+      return res.status(502).json({ error: 'Could not build the worksheet. Please try again.' });
+    }
+    const allowedTypes = (GRADE_STYLE_GUIDE[grade] && GRADE_STYLE_GUIDE[grade].types) || ['tf', 'mcq', 'problem'];
+    const usable = questions.filter(Boolean);
+    const filtered = usable.filter(q => allowedTypes.includes(q.type || 'problem'));
+    questions = filtered.length ? filtered : usable;
+    if (!questions.length) return res.status(502).json({ error: 'Could not build the worksheet. Please try again.' });
+
+    // The answer key is a second call. If it fails the worksheet is still worth having, so the
+    // questions are returned either way rather than failing the whole request.
+    let answers = [];
+    try {
+      const listed = questions.map((q, i) => {
+        const choices = (q.type === 'mcq' && Array.isArray(q.choices)) ? `\n   Choices: ${q.choices.join(' / ')}` : '';
+        return `${i + 1}. ${q.question}${choices}`;
+      }).join('\n');
+      const keyText = await callGroq(
+        withLanguage(ANSWER_KEY_SYSTEM_PROMPT, lang),
+        `Grade/branch: ${GRADE_LABELS[grade] || grade}\nTopic: ${topic}\n\n${listed}`,
+        Math.min(5000, 400 + questions.length * 260)
+      );
+      const parsed = extractJson(keyText);
+      if (Array.isArray(parsed)) answers = parsed.map(a => typeof a === 'string' ? a : String(a || ''));
+    } catch (err) {
+      console.error('Answer key generation failed (worksheet still returned):', err.message);
+    }
+
+    res.json({
+      grade, gradeLabel: GRADE_LABELS[grade] || grade, topic, difficulty: diff,
+      questions, answers,
+      answerKeyAvailable: answers.length === questions.length,
+    });
+  } catch (err) {
+    if (err.message === 'groq_timeout') return res.status(504).json({ error: 'The AI service took too long to respond. Please try again in a moment.' });
+    if (err.message === 'groq_error') return res.status(502).json({ error: 'The AI service returned an error. Check the server logs.' });
+    console.error('Worksheet error:', err);
+    res.status(500).json({ error: 'Something went wrong on the server.' });
+  }
+});
+
+// GET /api/teacher/reteach/:grade — the week's misconceptions, turned into a lesson plan.
+// Read-only and cheap to look at: the raw list comes from the database, and the AI is only
+// asked to turn the top few into teaching moves.
+app.get('/api/teacher/reteach/:grade', requireAuth, requireAdmin, aiLimiter, async (req, res) => {
+  const { grade } = req.params;
+  const days = Math.min(30, Math.max(1, Number(req.query.days) || 7));
+  if (!grade || !CURRICULUM[grade]) return res.status(400).json({ error: 'Please provide a valid grade.' });
+  if (!pool) return res.status(500).json({ error: 'No database connected on the server yet.' });
+
+  try {
+    // What went wrong, per misconception, with the method/calculation split alongside it.
+    const rows = await pool.query(
+      `SELECT t.title AS topic,
+              a.mistake_tag,
+              COUNT(*)::int AS occurrences,
+              COUNT(DISTINCT a.user_id)::int AS students,
+              COUNT(*) FILTER (WHERE a.method_correct = false)::int AS wrong_method,
+              COUNT(*) FILTER (WHERE a.method_correct = true)::int AS right_method_wrong_answer
+         FROM attempts a
+         JOIN users u ON u.id = a.user_id
+         JOIN topics t ON t.id = a.topic_id
+        WHERE u.grade = $1
+          AND COALESCE(u.is_demo, false) = false
+          AND a.correct = false
+          AND a.mistake_tag IS NOT NULL
+          AND a.created_at >= NOW() - ($2 * INTERVAL '1 day')
+        GROUP BY t.title, a.mistake_tag
+        ORDER BY COUNT(DISTINCT a.user_id) DESC, COUNT(*) DESC
+        LIMIT 8`,
+      [grade, days]
+    );
+
+    const findings = rows.rows.map(r => ({
+      topic: r.topic,
+      misconception: shortTagLabel(r.mistake_tag),
+      occurrences: r.occurrences,
+      students: r.students,
+      wrongMethod: r.wrong_method,
+      rightMethodWrongAnswer: r.right_method_wrong_answer,
+    }));
+
+    if (!findings.length) {
+      return res.json({
+        grade, days, findings: [], plans: [],
+        message: `No mistakes recorded for this grade in the last ${days} days — either they are doing well, or they have not been practising.`,
+      });
+    }
+
+    // The list itself is useful even if the AI part fails, so it is returned either way.
+    let plans = [];
+    if (process.env.GROQ_API_KEY) {
+      const summary = findings.slice(0, 5).map(f =>
+        `- "${f.misconception}" on ${f.topic}: ${f.occurrences} time(s) across ${f.students} student(s)` +
+        (f.wrongMethod || f.rightMethodWrongAnswer
+          ? ` (wrong method ${f.wrongMethod}, right method but wrong answer ${f.rightMethodWrongAnswer})`
+          : '')
+      ).join('\n');
+      try {
+        const text = await callGroq(
+          withLanguage(RETEACH_SYSTEM_PROMPT, 'en'),
+          `Grade/branch: ${GRADE_LABELS[grade] || grade}\nPeriod: last ${days} days\n\nWhat this class got wrong:\n${summary}`,
+          2000
+        );
+        plans = extractJson(text);
+        if (!Array.isArray(plans)) plans = [];
+      } catch (err) {
+        console.error('Reteach plan generation failed (returning raw findings):', err.message);
+      }
+    }
+
+    res.json({ grade, days, findings, plans });
+  } catch (err) {
+    console.error('Reteach list error:', err);
+    res.status(500).json({ error: 'Could not build the reteach list.' });
+  }
+});
 
 app.post('/api/teacher/recommend', requireAuth, requireAdmin, aiLimiter, async (req, res) => {
   const { grade } = req.body;
@@ -3659,7 +4053,7 @@ app.post('/api/teacher/recommend', requireAuth, requireAdmin, aiLimiter, async (
       return `${r.topic_title}: mastery ${mastery}, ${r.struggling_count} students struggling, top mistake: ${r.mistake_tag || 'none recorded'}`;
     }).join('\n');
 
-    const recommendation = await callGroq(TEACH_NEXT_SYSTEM_PROMPT, `Grade: ${grade}\n\n${summaryLines}`, 300);
+    const recommendation = await callGroq(withLanguage(TEACH_NEXT_SYSTEM_PROMPT, 'en'), `Grade: ${grade}\n\n${summaryLines}`, 300);
     res.json({ recommendation: recommendation || 'No recommendation returned.' });
   } catch (err) {
     if (err.message === 'groq_timeout') return res.status(504).json({ error: 'The AI service took too long to respond. Please try again in a moment.' });
